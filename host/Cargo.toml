@@ -1,0 +1,16 @@
+[package]
+name = "eink-host"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[[bin]]
+name = "eink-host"
+path = "src/main.rs"
+
+[dependencies]
+anyhow      = "1"
+clap        = { version = "4", features = ["derive"] }
+jpeg-decoder = "0.3"
+png          = "0.17"
+serialport   = "4"

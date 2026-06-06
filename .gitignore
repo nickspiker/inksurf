@@ -1,0 +1,11 @@
+target/
+
+# Editor / OS
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+
+# Temp files
+*.tmp.*

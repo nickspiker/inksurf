@@ -1,0 +1,35 @@
+[package]
+name = "eink"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+embassy-executor = { version = "0.6", features = ["arch-cortex-m", "executor-thread", "integrated-timers", "task-arena-size-8192"] }
+embassy-time     = { version = "0.3" }
+embassy-rp       = { version = "0.2", features = ["time-driver", "critical-section-impl", "rt", "boot2-w25q080", "unstable-pac"] }
+embassy-usb      = { version = "0.3" }
+embassy-sync     = { version = "0.6" }
+embassy-futures  = { version = "0.1" }
+
+embedded-io-async = "0.6"
+
+panic-halt   = "0.2"
+cortex-m     = { version = "0.7", features = ["inline-asm"] }
+cortex-m-rt  = "0.7"
+critical-section = "1.1"
+portable-atomic  = { version = "1.5", features = ["critical-section"] }
+static_cell      = "2"
+
+[features]
+default       = ["panel-ssd1680"]
+# SSD1680Z 2.13" 250×122 BW grayscale (Adafruit 6383) — the original panel.
+panel-ssd1680 = []
+# JD79667 3.52" 340×180 quad-color BWRY (Adafruit 6414) — second panel.
+panel-jd79667 = []
+
+[profile.release]
+opt-level     = "z"
+lto           = "fat"
+codegen-units = 1
+overflow-checks = false
