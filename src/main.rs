@@ -16,21 +16,8 @@ use embassy_usb::{Builder, Config as UsbConfig};
 use panic_halt as _;
 use static_cell::StaticCell;
 
-#[cfg(feature = "panel-ssd1680")]
 mod panel_ssd1680;
-#[cfg(feature = "panel-jd79667")]
 mod panel_jd79667;
-
-#[cfg(feature = "panel-ssd1680")]
-use panel_ssd1680 as panel;
-#[cfg(feature = "panel-jd79667")]
-use panel_jd79667 as panel;
-
-#[cfg(all(feature = "panel-ssd1680", feature = "panel-jd79667"))]
-compile_error!("Enable exactly one panel feature: panel-ssd1680 OR panel-jd79667");
-
-#[cfg(not(any(feature = "panel-ssd1680", feature = "panel-jd79667")))]
-compile_error!("Enable a panel feature: panel-ssd1680 OR panel-jd79667");
 
 bind_interrupts!(struct Irqs {
     USBCTRL_IRQ => UsbInterruptHandler<USB>;
@@ -89,12 +76,13 @@ async fn geiger_task(mut led: Output<'static>) {
     if state == 0 {
         state = 0xACE1DEED;
     }
+    // Feather D13 LED: HIGH = on, LOW = off.
     loop {
         let on_us = on_pulse_us(&mut state);
-        led.set_low();
+        led.set_high();
         Timer::after_micros(on_us).await;
         let off_us = off_pulse_us(&mut state);
-        led.set_high();
+        led.set_low();
         Timer::after_micros(off_us).await;
     }
 }
@@ -190,8 +178,8 @@ impl<'a, 'd, D: UsbDriverTrait<'d>> RxStream<'a, 'd, D> {
 async fn main(spawner: Spawner) {
     let p = embassy_rp::init(Default::default());
 
-    // Geiger LED on GP29.
-    let led = Output::new(p.PIN_29, Level::High);
+    // Geiger heartbeat on the Feather D13 user LED (GP13, normal polarity).
+    let led = Output::new(p.PIN_13, Level::Low);
     spawner.spawn(geiger_task(led)).unwrap();
 
     // Feather RP2040 ThinkInk pinout — shared between panel types.
@@ -207,7 +195,7 @@ async fn main(spawner: Spawner) {
     let driver = UsbDriver::new(p.USB, Irqs);
     let mut config = UsbConfig::new(0x1209, 0x000d);
     config.manufacturer = Some("ferros");
-    config.product = Some(panel::USB_PRODUCT);
+    config.product = Some("eink-multi");
     config.serial_number = Some("dev-0001");
     config.max_power = 100;
     config.max_packet_size_0 = 64;
@@ -232,8 +220,37 @@ async fn main(spawner: Spawner) {
     let usb = builder.build();
     spawner.spawn(run_usb(usb)).unwrap();
 
-    let (mut sender, receiver) = class.split();
+    let (mut sender, mut receiver) = class.split();
     sender.wait_connection().await;
 
-    panel::run(spi, cs, dc, rst, busy, sender, receiver).await
+    // Panel-select handshake. Host sends 'M' + panel-id byte before any other
+    // command. After this point, the chosen driver's run() takes over and
+    // never returns — switching panels requires an RP2040 reset.
+    say(
+        &mut sender,
+        b"\r\nferros eink-multi v0.1\r\n\
+        Send 'M' + 1 byte to select panel:\r\n\
+          0 = SSD1680 (Adafruit 6383 / 6392 grayscale)\r\n\
+          1 = JD79667 (Adafruit 6414 BWRY)\r\n",
+    )
+    .await;
+
+    let mode = wait_for_select(&mut receiver).await;
+    match mode {
+        0 => panel_ssd1680::run(spi, cs, dc, rst, busy, sender, receiver).await,
+        _ => panel_jd79667::run(spi, cs, dc, rst, busy, sender, receiver).await,
+    }
+}
+
+/// Block until the host sends `'M' + 1B` selecting a panel mode.
+/// Any bytes received before 'M' are silently dropped (lets the firmware
+/// shrug off ModemManager AT-probe noise during enumeration).
+async fn wait_for_select<'d, D: UsbDriverTrait<'d>>(rx: &mut Receiver<'d, D>) -> u8 {
+    let mut rs = RxStream::new(rx);
+    loop {
+        let b = rs.read_byte().await;
+        if b == b'M' || b == b'm' {
+            return rs.read_byte().await;
+        }
+    }
 }

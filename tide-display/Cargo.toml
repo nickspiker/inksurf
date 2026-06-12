@@ -1,0 +1,21 @@
+[package]
+name = "tide-display"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[[bin]]
+name = "tide-display"
+path = "src/main.rs"
+
+[dependencies]
+anyhow      = "1"
+chrono      = { version = "0.4", features = ["clock", "serde"] }
+chrono-tz   = "0.10"
+reqwest     = { version = "0.12", default-features = false, features = ["rustls-tls", "blocking", "json"] }
+serde       = { version = "1", features = ["derive"] }
+serde_json  = "1"
+serialport  = "4"
+png         = "0.17"
+sunrise     = "1"
+fastrand    = "2"

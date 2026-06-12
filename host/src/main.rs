@@ -6,10 +6,12 @@ use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::time::Duration;
 
-const PANEL_W: u32 = 122;
-const PANEL_H: u32 = 250;
-const ROW_BYTES: usize = ((PANEL_W as usize) + 7) / 8; // 16
-const FB_BYTES: usize = ROW_BYTES * PANEL_H as usize; // 4000
+// SSD1680 panel native (chip-portrait) dimensions for the Adafruit 6392
+// 2.9" 296×152 panel: 152 source × 296 gates.
+const PANEL_W: u32 = 152;
+const PANEL_H: u32 = 296;
+const ROW_BYTES: usize = ((PANEL_W as usize) + 7) / 8; // 19
+const FB_BYTES: usize = ROW_BYTES * PANEL_H as usize; // 5624
 
 #[derive(Parser)]
 #[command(name = "eink-host", about = "Drive the ferros eink board")]
@@ -26,7 +28,7 @@ enum Cmd {
     /// Trigger the firmware's built-in stripe test pattern.
     Test,
 
-    /// Send a raw 4000-byte BW plane file to the panel.
+    /// Send a raw BW plane file to the panel (size must match FB_BYTES).
     Raw { file: PathBuf },
 
     /// Convert and send an image file (jpeg/png) to the panel.
@@ -478,13 +480,13 @@ fn send_bwry_image(device: &str, file: &std::path::Path, rotate: u16, dither: Di
     eprintln!("  red   : {:>6}  ({:.1}%)", hist[3], 100.0 * hist[3] as f32 / total);
 
     // Transpose into chip RAM layout: 180-wide × 384-tall, 45 bytes/row.
-    // Source landscape (x_src, y_src) → chip (chip_col=y_src, chip_row=x_src).
-    // Chip-rows 340..383 stay as 0x55 = white padding.
+    // The panel's chip_row 0 maps to the physical right edge, so we mirror
+    // along X: source (x_src, y_src) → chip (chip_col=y_src, chip_row=W-1-x_src).
     let mut fb = vec![0x55u8; BWRY_FB_BYTES];
     for y_src in 0..BWRY_H {
         for x_src in 0..BWRY_W {
             let code = codes[y_src * BWRY_W + x_src] & 0x3;
-            let chip_row = x_src;
+            let chip_row = BWRY_W - 1 - x_src;
             let chip_col = y_src;
             let byte_idx = chip_row * BWRY_CHIP_ROW_BYTES + chip_col / 4;
             let shift = (3 - (chip_col % 4)) * 2;
@@ -494,7 +496,7 @@ fn send_bwry_image(device: &str, file: &std::path::Path, rotate: u16, dither: Di
     }
 
     eprintln!("Sending {} bytes to panel...", fb.len());
-    let mut port = open_port(device)?;
+    let mut port = open_panel(device, MODE_JD79667)?;
     port.write_all(&[b'I'])?;
     std::thread::sleep(Duration::from_millis(30));
     for chunk in fb.chunks(64) {
@@ -653,44 +655,43 @@ fn pyramid_pairs(max_level: u8) -> Vec<(u8, u8)> {
 //   - VCOM all 0x00
 // ============================================================================
 
-/// Calibrated recipe set with normalized L* values from auto_char.csv run 2.
-/// L* values are normalized to panel-white = 100 (removes i1Pro cal whitepoint
-/// drift), measured in actual multi-pass render context. Sorted lightest →
-/// darkest. Near-duplicate L* values within ~1 L* are kept since rendering
-/// behavior may differ slightly.
+/// Calibrated recipe set for the Adafruit 6392 SSD1680 296×152 panel,
+/// measured via auto_char.csv. L* values are normalized to panel-white = 100.
+/// Sorted lightest → darkest. Note this panel has less contrast than the 6383
+/// (deepest L* = 30.9 vs 23.1) and highlight recipes saturate at white.
 fn gray_recipes(n_levels: u8) -> Vec<(f32, Vec<(u8, u8)>)> {
     let all: &[(f32, &[(u8, u8)])] = &[
         (100.0, &[]),                             // white
-        (99.0,  &[(0x40, 1), (0x80, 3)]),         // (1,3)
-        (97.9,  &[(0x40, 32), (0x80, 24)]),       // sat+24
-        (96.7,  &[(0x40, 32), (0x80, 16)]),       // sat+16
-        (96.6,  &[(0x40, 1), (0x80, 2)]),         // (1,2)
-        (95.6,  &[(0x40, 32), (0x80, 12)]),       // sat+12
-        (94.6,  &[(0x40, 32), (0x80, 10)]),       // sat+10
-        (94.0,  &[(0x40, 1), (0x80, 1)]),         // (1,1)
-        (92.8,  &[(0x40, 32), (0x80, 8)]),        // sat+8
-        (88.9,  &[(0x40, 1)]),                    // VSL:1 (drifts heavy in multi-pass)
-        (88.5,  &[(0x40, 32), (0x80, 6)]),        // sat+6
-        (85.8,  &[(0x40, 2), (0x80, 2)]),         // (2,2)
-        (83.8,  &[(0x40, 32), (0x80, 5)]),        // sat+5
-        (76.0,  &[(0x40, 32), (0x80, 4)]),        // sat+4
-        (71.8,  &[(0x40, 2), (0x80, 1)]),         // (2,1)
-        (64.1,  &[(0x40, 32), (0x80, 3)]),        // sat+3
-        (63.3,  &[(0x40, 2)]),                    // VSL:2
-        (59.4,  &[(0x40, 3), (0x80, 1)]),         // (3,1)
-        (49.9,  &[(0x40, 3)]),                    // VSL:3
-        (47.3,  &[(0x40, 32), (0x80, 2)]),        // sat+2
-        (46.2,  &[(0x40, 4)]),                    // VSL:4
-        (41.8,  &[(0x40, 5)]),                    // VSL:5
-        (38.6,  &[(0x40, 6)]),                    // VSL:6
-        (34.6,  &[(0x40, 8)]),                    // VSL:8
-        (33.6,  &[(0x40, 32), (0x80, 1)]),        // sat+1
-        (31.8,  &[(0x40, 10)]),                   // VSL:10
-        (30.9,  &[(0x40, 12)]),                   // VSL:12
-        (28.9,  &[(0x40, 16)]),                   // VSL:16
-        (27.3,  &[(0x40, 20)]),                   // VSL:20
-        (25.6,  &[(0x40, 24)]),                   // VSL:24
-        (23.1,  &[(0x40, 32)]),                   // VSL:32 — deepest
+        (100.0, &[(0x40, 32), (0x80, 24)]),       // sat+24 (saturates white)
+        (100.0, &[(0x40, 32), (0x80, 16)]),       // sat+16 (saturates white)
+        ( 99.9, &[(0x40, 32), (0x80, 12)]),       // sat+12
+        ( 99.2, &[(0x40, 32), (0x80, 10)]),       // sat+10
+        ( 98.0, &[(0x40, 32), (0x80,  8)]),       // sat+8
+        ( 97.0, &[(0x40,  1), (0x80,  2)]),       // (1,2)
+        ( 96.1, &[(0x40,  1), (0x80,  3)]),       // (1,3)
+        ( 94.7, &[(0x40, 32), (0x80,  6)]),       // sat+6
+        ( 90.7, &[(0x40, 32), (0x80,  5)]),       // sat+5
+        ( 89.8, &[(0x40,  2), (0x80,  2)]),       // (2,2)
+        ( 86.9, &[(0x40,  1), (0x80,  1)]),       // (1,1)
+        ( 83.3, &[(0x40, 32), (0x80,  4)]),       // sat+4
+        ( 70.8, &[(0x40, 32), (0x80,  3)]),       // sat+3
+        ( 70.4, &[(0x40,  1)]),                   // VSL:1
+        ( 66.0, &[(0x40,  2), (0x80,  1)]),       // (2,1)
+        ( 55.8, &[(0x40,  3), (0x80,  1)]),       // (3,1)
+        ( 55.2, &[(0x40, 32), (0x80,  2)]),       // sat+2
+        ( 52.4, &[(0x40,  2)]),                   // VSL:2
+        ( 45.5, &[(0x40,  3)]),                   // VSL:3
+        ( 44.4, &[(0x40,  4)]),                   // VSL:4
+        ( 42.3, &[(0x40,  5)]),                   // VSL:5
+        ( 42.1, &[(0x40, 32), (0x80,  1)]),       // sat+1
+        ( 40.9, &[(0x40,  6)]),                   // VSL:6
+        ( 39.2, &[(0x40,  8)]),                   // VSL:8
+        ( 38.8, &[(0x40, 10)]),                   // VSL:10
+        ( 37.4, &[(0x40, 12)]),                   // VSL:12
+        ( 36.0, &[(0x40, 16)]),                   // VSL:16
+        ( 35.0, &[(0x40, 20)]),                   // VSL:20
+        ( 34.1, &[(0x40, 24)]),                   // VSL:24
+        ( 30.9, &[(0x40, 32)]),                   // VSL:32 — deepest
     ];
 
     let n = n_levels.max(2).min(all.len() as u8) as usize;
@@ -726,22 +727,21 @@ fn gray_recipes(n_levels: u8) -> Vec<(f32, Vec<(u8, u8)>)> {
 ///   L*= 27  VSL:20
 fn shadow_recipes() -> Vec<(f32, Vec<(u8, u8)>)> {
     vec![
-        // "White" rides the same push+pull plane as the rest of the sat family
-        // so the white/gray boundary doesn't show edge artifacts. VSH1:24 is the
-        // deepest pull we've measured from VSL:32 — gets to L*=97.9, not pure
-        // paper-white but close. Pure white from sat would need a bipolar cycle.
-        ( 97.9, vec![(0x40, 32), (0x80, 24)]),
+        // "White" rides the same push+pull plane as the rest of the sat family.
+        // sat+24 reaches paper-white on the 6392 (clipped at L*=100).
+        (100.0, vec![(0x40, 32), (0x80, 24)]),
         // sat+pull family — all share VSL:32 push base
-        ( 88.5, vec![(0x40, 32), (0x80, 6)]),
-        ( 76.0, vec![(0x40, 32), (0x80, 4)]),
-        ( 64.1, vec![(0x40, 32), (0x80, 3)]),
-        ( 47.3, vec![(0x40, 32), (0x80, 2)]),
-        ( 33.6, vec![(0x40, 32), (0x80, 1)]),
-        ( 23.1, vec![(0x40, 32)]),
-        // single-pulse family
-        ( 38.6, vec![(0x40,  6)]),
-        ( 31.8, vec![(0x40, 10)]),
-        ( 27.3, vec![(0x40, 20)]),
+        ( 94.7, vec![(0x40, 32), (0x80, 6)]),
+        ( 83.3, vec![(0x40, 32), (0x80, 4)]),
+        ( 70.8, vec![(0x40, 32), (0x80, 3)]),
+        ( 55.2, vec![(0x40, 32), (0x80, 2)]),
+        ( 42.1, vec![(0x40, 32), (0x80, 1)]),
+        ( 30.9, vec![(0x40, 32)]),
+        // single-pulse family — VSL:6 is now too close to sat+1, so dropped
+        // in favor of more shadow-direction coverage.
+        ( 38.8, vec![(0x40, 10)]),
+        ( 36.0, vec![(0x40, 16)]),
+        ( 35.0, vec![(0x40, 20)]),
     ]
 }
 
@@ -1166,7 +1166,7 @@ fn render_gradient(device: &str, n_bands: Option<u8>, shadow: bool, planes: bool
     }
 
     // Assign each pixel to a band based on its Y coordinate.
-    // Panel is 122 wide × 250 tall (portrait); use Y axis for bands.
+    // Panel is PANEL_W wide × PANEL_H tall (portrait); use Y axis for bands.
     let mut level_idx = vec![0u8; PANEL_W as usize * PANEL_H as usize];
     for y in 0..PANEL_H as usize {
         let band = (y * levels.len()) / PANEL_H as usize;
@@ -1896,11 +1896,26 @@ fn wait_enter_tty() {
     }
 }
 
+// Unified-firmware panel select bytes.
+const MODE_SSD1680: u8 = 0;
+const MODE_JD79667: u8 = 1;
+
+/// Open the serial port and select the SSD1680 driver in the unified firmware.
 fn open_port(device: &str) -> Result<Box<dyn serialport::SerialPort>> {
+    open_panel(device, MODE_SSD1680)
+}
+
+/// Open the serial port and send `M`+mode to pin the firmware to a panel.
+/// First call after firmware reset is the one that sticks; subsequent calls
+/// (after the driver loop has taken over) are silently ignored, which is fine.
+fn open_panel(device: &str, mode: u8) -> Result<Box<dyn serialport::SerialPort>> {
     let mut port = serialport::new(device, 115_200)
         .timeout(Duration::from_millis(500))
         .open()
         .with_context(|| format!("opening {device}"))?;
+    // Send panel-select handshake.
+    port.write_all(&[b'M', mode])?;
+    port.flush()?;
     // Drain until silent for 500ms (handles post-boot banner + test refresh).
     let mut sink = [0u8; 1024];
     let mut last_data = std::time::Instant::now();

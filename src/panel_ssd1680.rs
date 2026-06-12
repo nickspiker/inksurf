@@ -1,7 +1,9 @@
-//! Adafruit 6383 / SSD1680Z 2.13" 250×122 BW grayscale panel.
+//! Adafruit 6392 / SSD1680 2.9" 296×152 BW grayscale panel.
 //!
-//! Native RAM layout: 122 columns × 250 gates. 122 px ÷ 8 = 15.25 → 16 bytes/row.
-//! Multi-pass grayscale via custom LUT writes — see host-side recipe table.
+//! Native RAM layout: 152 source × 296 gates (chip-portrait).
+//! 152 px ÷ 8 = 19 bytes/row. Multi-pass grayscale via custom LUT writes —
+//! same recipe table architecture as the 6383 but recipe L* values may need
+//! re-characterization for this specific panel's ink response.
 
 use embassy_rp::gpio::{Input, Output};
 use embassy_rp::peripherals::{SPI0, USB};
@@ -13,14 +15,12 @@ use static_cell::StaticCell;
 
 use crate::{RxStream, say, say_hex_byte};
 
-const PANEL_W: usize = 122;
-const PANEL_H: usize = 250;
-const ROW_BYTES: usize = (PANEL_W + 7) / 8; // 16
-const FB_BYTES: usize = ROW_BYTES * PANEL_H; // 4000
+const PANEL_W: usize = 152;
+const PANEL_H: usize = 296;
+const ROW_BYTES: usize = (PANEL_W + 7) / 8; // 19
+const FB_BYTES: usize = ROW_BYTES * PANEL_H; // 5624
 
 const LUT_LEN: usize = 159; // 153 LUT bytes + 6 voltage/timing tail bytes
-
-pub const USB_PRODUCT: &str = "eink-ssd1680";
 
 const TAIL_DEFAULT: [u8; 6] = [0x22, 0x17, 0x41, 0x00, 0x32, 0x36];
 
@@ -188,11 +188,14 @@ pub async fn run(
 ) -> ! {
     let mut panel = Ssd1680 { spi, cs, dc, rst, busy };
 
+    // Zero-init via BSS, then fill at runtime — avoids 5,624-byte stack temps.
     static FB: StaticCell<[u8; FB_BYTES]> = StaticCell::new();
-    let fb = FB.init([0xFF; FB_BYTES]);
+    let fb = FB.init([0u8; FB_BYTES]);
+    fb.fill(0xFF);
 
     static PREV_FB: StaticCell<[u8; FB_BYTES]> = StaticCell::new();
-    let prev_fb = PREV_FB.init([0xFF; FB_BYTES]);
+    let prev_fb = PREV_FB.init([0u8; FB_BYTES]);
+    prev_fb.fill(0xFF);
 
     static PULSE_LUT: StaticCell<[u8; LUT_LEN]> = StaticCell::new();
     let pulse_lut = PULSE_LUT.init([0; LUT_LEN]);
@@ -207,13 +210,13 @@ pub async fn run(
         b"\r\nferros eink-ssd1680 v0.2\r\n\
         Commands:\r\n\
         'T' = stripe test\r\n\
-        'I' + 4000B = upload + refresh BW image\r\n\
+        'I' + 5624B = upload + refresh BW image\r\n\
         'W' = clear to white (OTP refresh)\r\n\
         'K' = clear to black (OTP refresh)\r\n\
         'F' + 1B = fill BW plane with byte, no refresh\r\n\
         'P' + voltage:1B + frames:1B = 1-phase pulse LUT and refresh\r\n\
         'L' + 159B = upload arbitrary LUT and refresh\r\n\
-        'A' + 4000B(prev) + 4000B(new) + 159B(LUT) = multi-pass step\r\n\
+        'A' + 5624B(prev) + 5624B(new) + 159B(LUT) = multi-pass step\r\n\
         'B' = sample BUSY pin\r\n\
         \r\n[boot] writing stripe pattern...\r\n",
     )
@@ -238,7 +241,7 @@ pub async fn run(
                 say(&mut sender, b"[T] done\r\n").await;
             }
             b'I' | b'i' => {
-                say(&mut sender, b"[I] expecting 4000B BW...\r\n").await;
+                say(&mut sender, b"[I] expecting 5624B BW...\r\n").await;
                 if rs.read_exact(fb).await {
                     panel.write_bw(fb).await;
                     panel.write_red_blank().await;
@@ -303,7 +306,7 @@ pub async fn run(
                 }
             }
             b'A' | b'a' => {
-                say(&mut sender, b"[A] expecting 4000B prev + 4000B new + 159B LUT...\r\n").await;
+                say(&mut sender, b"[A] expecting 5624B prev + 5624B new + 159B LUT...\r\n").await;
                 if !rs.read_exact(prev_fb).await {
                     say(&mut sender, b"[A] prev timeout\r\n").await;
                     continue;

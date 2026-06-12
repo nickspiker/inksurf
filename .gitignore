@@ -9,3 +9,9 @@ target/
 
 # Temp files
 *.tmp.*
+
+# Third-party prebuilt blobs (ATC reference firmware, not ours to redistribute)
+firmware/
+
+# Stale hero asset; README now points to assets/hero.webp
+docs/

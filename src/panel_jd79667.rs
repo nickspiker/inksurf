@@ -31,8 +31,6 @@ const ROW_BYTES: usize = CHIP_W / 4; // 45
 // Buffer = width rounded to mult of 8 (184) × height / 4 = 17,664.
 const FB_BYTES: usize = ((CHIP_W + 7) & !7) * CHIP_H / 4; // 17,664
 
-pub const USB_PRODUCT: &str = "eink-jd79667";
-
 // Command codes
 const CMD_PSR: u8 = 0x00; // Panel Setting
 const CMD_PWR: u8 = 0x01; // Power Setting
@@ -208,8 +206,11 @@ pub async fn run(
 ) -> ! {
     let mut panel = Jd79667 { spi, cs, dc, rst, busy };
 
+    // Zero-init via BSS, then fill at runtime — avoids a 17,664-byte stack
+    // temporary inside the spawned task during StaticCell::init.
     static FB: StaticCell<[u8; FB_BYTES]> = StaticCell::new();
-    let fb = FB.init([0x55; FB_BYTES]); // 0x55 = WWWW packed (all white)
+    let fb = FB.init([0u8; FB_BYTES]);
+    fb.fill(0x55); // 0x55 = WWWW packed (all white)
 
     say(
         &mut sender,
@@ -222,18 +223,14 @@ pub async fn run(
         'Y' = fill yellow + refresh\r\n\
         'R' = fill red + refresh\r\n\
         'B' = sample BUSY pin\r\n\
-        \r\n[boot] writing color bands...\r\n",
+        \r\n[boot] init chip, waiting for I command...\r\n",
     )
     .await;
 
-    // Boot init brings chip up from cold (hw_reset wakes from any prior
-    // deep-sleep state, init code sets PSR/PWR/etc. and ends with POWER_ON).
+    // Boot init wakes the chip from any prior deep-sleep state and ends with POWER_ON; we immediately power off and wait for a host I command before refreshing. No boot test pattern - whatever was last on the panel stays put.
     panel.init().await;
-    fill_color_bands(fb);
-    panel.write_image(fb).await;
-    panel.refresh().await;
     panel.power_off().await;
-    say(&mut sender, b"[boot] done\r\n").await;
+    say(&mut sender, b"[boot] ready\r\n").await;
 
     let mut rs = RxStream::new(&mut receiver);
     loop {
