@@ -79,7 +79,7 @@ impl Jd79667 {
         self.cs.set_high();
     }
 
-    /// Standard EPD transaction: hold CS low through both cmd and data phases,
+    /// Standard EPD transaction: hold CS low thru both cmd and data phases,
     /// toggling DC to demarcate them.
     async fn cmd_data(&mut self, c: u8, d: &[u8]) {
         self.dc.set_low();
@@ -115,7 +115,7 @@ impl Jd79667 {
     }
 
     /// Stream a single 2bpp framebuffer (15,480 B) to the chip via DTM.
-    /// CS stays low through cmd + all data.
+    /// CS stays low thru cmd + all data.
     async fn write_image(&mut self, fb: &[u8]) {
         self.dc.set_low();
         self.cs.set_low();
@@ -148,7 +148,7 @@ impl Jd79667 {
         self.wait_idle().await;
         // Adafruit pattern uses an additional 13s settling delay after busy_wait
         // returns, before powering down. We don't know if BUSY actually wired
-        // through; this extra fixed delay keeps the chip undisturbed long enough
+        // thru; this extra fixed delay keeps the chip undisturbed long enough
         // for the ink to fully settle.
         Timer::after_millis(13_000).await;
     }

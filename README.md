@@ -9,14 +9,14 @@ A paper-display tide clock for the Salish Sea.
 24-hour tide curve centered on right-now, plus the day's celestial scaffolding, all rendered to a 384×180 BWRY e-ink display.
 
 - **Tide curve** — yellow below the waterline, white above (in daytime columns). Fixed HAT/LAT vertical scale (`-4.6 ft` to `+14.1 ft` MLLW) so curve heights are directly comparable day to day.
-- **Now line** — vertical black bar through panel center with current time as text. Per-pixel inverted from background so it stays legible across the day/night seam.
+- **Now line** — vertical black bar thru panel center with current time as text. Per-pixel inverted from background so it stays legible across the day/night seam.
 - **High / low markers** — red vertical lines with `HH:MM` times; high-tide labels sit below the curve (bottom third), low-tide labels above (top third).
 - **Sunrise / sunset labels** — `HH:MM` rendered vertically at the day/night seam columns, glyphs rotated 90° (CCW at sunrise so you read it bottom-up, CW at sunset so you read it top-down).
 - **Hourly ticks** — 1-px marks on the top and bottom edges. Local midnight gets a 2-px-tall tick to anchor the calendar boundary.
 - **Day/night colorscheme** — pixels in columns where the sun is below the horizon are inverted as a final pass: `WHITE ↔ BLACK`, `RED ↔ YELLOW`. The seam is a sharp visual transition right where sunrise and sunset happen.
 - **Moon cycle indicator** — 2-pixel diagonal arrow on the left edge that traces a sine wave over the 29.5-day synodic month. Rising arrow when waxing, falling arrow when waning. Within 12 h of new or full, the arrow becomes a 2-px horizontal line at the very bottom (new moon) or top (full moon).
 - **Solar year indicator** — same treatment on the right edge over the 365.25-day cycle. Winter solstice at the bottom, summer at the top, 2-px horizontal marker when within 12 h of either solstice.
-- **Solar-midnight deep clean** — once per day at solar midnight (midpoint between yesterday's sunset and today's sunrise; DST-immune by construction), the daemon cycles the panel through `K → Y → R → W` to exercise every ink particle and clear ghosting.
+- **Solar-midnight deep clean** *(optional, off by default)* — when enabled, once per night at solar midnight (midpoint between yesterday's sunset and today's sunrise; DST-immune by construction) the daemon cycles the panel thru `K → Y → R → W` to exercise every ink particle and clear ghosting. Normal operation already moves every pixel daily, so it's not needed in practice — see [How it works](#how-it-works).
 
 ## Hardware
 
@@ -31,7 +31,7 @@ Three Rust crates in one repo, one umbrella:
 
 - [`src/`](src/) — embedded firmware for the RP2040. Driver modules for **SSD1680** (Adafruit 6383, 6392 grayscale panels) and **JD79667** (Adafruit 6414 BWRY). Unified binary; the host picks the active panel at boot via `M` + panel-id byte.
 - [`host/`](host/) — `eink-host` CLI for ad-hoc interaction: send raw frames, drive multi-pass grayscale renders against the SSD1680 panels, fire BWRY images at the JD79667.
-- [`tide-display/`](tide-display/) — the inksurf daemon. Fetches NOAA CO-OPS predictions, renders the display, pushes it to the panel every 7–9 minutes.
+- [`tide-display/`](tide-display/) — the inksurf daemon. Fetches NOAA CO-OPS predictions, renders the display, and pushes it to the panel every few minutes (a random 7–9 min in the classic decimal edition; aligned to `HH:X5` in the dozenal edition — see [How it works](#how-it-works)).
 
 ## Quickstart
 
@@ -52,22 +52,13 @@ It prints status to stderr and writes a debug PPM to `/tmp/tide-render.ppm` ever
 
 ### As a service
 
-A minimal systemd unit (`/etc/systemd/system/inksurf.service`):
+`deploy/install.sh` builds the release binary, installs it to `/usr/local/bin/inksurf`, drops the systemd unit, and enables it:
 
-```ini
-[Unit]
-Description=inksurf tide display daemon
-After=network-online.target
-
-[Service]
-ExecStart=/path/to/inksurf/tide-display/target/x86_64-unknown-linux-gnu/release/tide-display
-Restart=always
-RestartSec=10
-User=YOUR_USER
-
-[Install]
-WantedBy=multi-user.target
+```sh
+deploy/install.sh
 ```
+
+Re-run it after every release build — the binary is installed (not run in place) so SELinux-enforcing hosts can exec it (files under an arbitrary `/mnt` mount get an `unlabeled_t` context the service domain may refuse; `/usr/local/bin` is properly labeled `bin_t`). The unit template lives at [`deploy/inksurf.service`](deploy/inksurf.service); edit `User=` and the `INKSURF_DOZENAL` line there before installing.
 
 Don't forget the udev rule (next section) so ModemManager doesn't poke the panel's USB port.
 
@@ -99,9 +90,9 @@ Then unplug / replug the panel.
 
 **Bitmap font, hand-drawn.** A small set of digit + colon PNGs in [`assets/font/`](assets/font/) carry the typography. Decoded at compile time via `include_bytes!`; the font cache is a `OnceLock`. No proportional-spacing tricks — each glyph is a hand-tuned variable-width bitmap.
 
-**Deep clean.** Solar midnight is the midpoint between yesterday's sunset and today's sunrise (via the [`sunrise`](https://crates.io/crates/sunrise) crate). Once per day at that instant the daemon cycles `K → Y → R → W` (~4 minutes) to exercise all four ink particles. Daylight saving never enters the equation.
+**Deep clean (optional, off by default).** Set `INKSURF_DEEP_CLEAN=1` and once per night the daemon cycles `K → Y → R → W` (~4 minutes) to exercise all four ink particles. The trigger is event-based: solar midnight (the midpoint between yesterday's sunset and today's sunrise, via the [`sunrise`](https://crates.io/crates/sunrise) crate) is a per-night identifier, and the clean fires whenever it differs from the last one cleaned — cadence-independent, fires exactly once per night, DST-immune. It's off by default because normal operation already exercises every particle daily: the curve slides past every pixel and the day/night invert pass sweeps the seam across every column, so nothing dwells long enough to ghost. Enable it only if you observe ghosting (or run a long static display).
 
-**Random tick interval.** The daemon sleeps a random 7–9 minutes between refreshes so wall-clock updates don't land on identical minute marks day after day.
+**Two time editions, two cadences.** Leave `INKSURF_DOZENAL` unset (the default, classic edition) and labels render as plain decimal `HH:MM`; the daemon sleeps a fresh random 7–9 minutes between refreshes so updates don't land on identical wall-clock minutes hour after hour. Set `INKSURF_DOZENAL=1` and the now-line / hi-lo labels render as a 2-symbol base-12 odometer of `(HH*60+MM)/10` (`Zil`, `Zila`, `Zilor`, … `Stelor`) drawn from the hand-made glyphs in [`assets/font/`](assets/font/); in this edition the daemon ticks on every local clock-minute ending in 5 (`HH:05`, `HH:15`, …), so the rounded-to-nearest-10 odometer symbol flips exactly when the panel refreshes and is never stale.
 
 ## Credits
 

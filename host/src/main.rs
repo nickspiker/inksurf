@@ -627,7 +627,7 @@ fn send_lut(device: &str, lut: &[u8; LUT_LEN]) -> Result<()> {
     Ok(())
 }
 
-/// Generate pyramid (away, back) pairs through level `max_level` inclusive.
+/// Generate pyramid (away, back) pairs thru level `max_level` inclusive.
 /// Level N has N pairs: (1, N-1), (2, N-2), ..., (N, 0).
 fn pyramid_pairs(max_level: u8) -> Vec<(u8, u8)> {
     let mut out = Vec::new();

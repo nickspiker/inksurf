@@ -8,7 +8,7 @@
 //! No anti-aliasing, no curve line — the curve is just the boundary between the two filled regions.
 
 use anyhow::{anyhow, Context, Result};
-use chrono::{DateTime, Datelike, Duration, Local, TimeZone, Timelike, Utc};
+use chrono::{DateTime, Duration, Local, TimeZone, Timelike, Utc};
 use chrono_tz::US::Pacific;
 use serde::Deserialize;
 use std::collections::HashMap;
@@ -22,7 +22,8 @@ use std::time::Duration as StdDuration;
 
 struct Glyph {
     width: usize,
-    /// width * 12 bytes, row-major. Non-zero = pixel is "on".
+    height: usize,
+    /// width * height bytes, row-major. Non-zero = pixel is "on".
     bits: Vec<u8>,
 }
 
@@ -62,7 +63,6 @@ fn decode_png(bytes: &[u8]) -> Glyph {
     let info = reader.next_frame(&mut buf).expect("png next_frame");
     let w = info.width as usize;
     let h = info.height as usize;
-    assert_eq!(h, GLYPH_H, "all font PNGs must be {} px tall", GLYPH_H);
     let bpp = (info.line_size / w).max(1);
     let mut bits = Vec::with_capacity(w * h);
     for y in 0..h {
@@ -72,18 +72,66 @@ fn decode_png(bytes: &[u8]) -> Glyph {
             bits.push(if buf[idx] > 128 { 1 } else { 0 });
         }
     }
-    Glyph { width: w, bits }
+    Glyph { width: w, height: h, bits }
 }
 
+/// Decimal font glyph height (12 px). Used for sizing label bands when in the default HH:MM mode.
 const GLYPH_H: usize = 12;
+/// Dozenal font glyph height (16 px).
+const DOZENAL_GLYPH_H: usize = 16;
 /// Horizontal gap inserted between glyphs (px).
 const GLYPH_KERN: i32 = 1;
 
-/// Paint mode for the drawing primitives. `Solid(c)` stamps `c` directly; `Invert` flips the underlying pixel: BLACK↔WHITE, RED↔YELLOW. The invert mode keeps the "now" indicator visible across sunrise/sunset transitions without snapping the whole line/text from one solid color to another.
-#[derive(Copy, Clone)]
-enum Paint {
-    Solid(u8),
-    Invert,
+// ── Dozenal font + helpers ──────────────────────────────────────────────
+// Dozenal mode renders times as a 2-digit base-12 odometer of `minute / 10`:
+//   counter = (HH*60 + MM) / 10   in 0..143
+//   hi      = counter / 12        in 0..11
+//   lo      = counter % 12        in 0..11
+// e.g. 00:00 → ZilZil, 02:00 → ZilaZil, 23:50 → StelorStelor.
+//
+// Each glyph is hand-drawn at 16 px tall; widths vary. There is no colon —
+// the marker line at the label's anchor_x becomes the visual gap between the
+// two symbols (we leave a 1-px column un-stamped). The 12 symbols, in order,
+// are: Zil, Zila, Zilor, Ter, Tera, Teror, Lun, Luna, Lunor, Stel, Stela,
+// Stelor — matching the PNG filenames loaded into DOZENAL_GLYPHS below.
+
+static DOZENAL_GLYPHS: OnceLock<Vec<Glyph>> = OnceLock::new();
+
+fn dozenal_glyphs() -> &'static [Glyph] {
+    DOZENAL_GLYPHS.get_or_init(|| vec![
+        decode_png(include_bytes!("../../assets/font/Zil.png")),
+        decode_png(include_bytes!("../../assets/font/Zila.png")),
+        decode_png(include_bytes!("../../assets/font/Zilor.png")),
+        decode_png(include_bytes!("../../assets/font/Ter.png")),
+        decode_png(include_bytes!("../../assets/font/Tera.png")),
+        decode_png(include_bytes!("../../assets/font/Teror.png")),
+        decode_png(include_bytes!("../../assets/font/Lun.png")),
+        decode_png(include_bytes!("../../assets/font/Luna.png")),
+        decode_png(include_bytes!("../../assets/font/Lunor.png")),
+        decode_png(include_bytes!("../../assets/font/Stel.png")),
+        decode_png(include_bytes!("../../assets/font/Stela.png")),
+        decode_png(include_bytes!("../../assets/font/Stelor.png")),
+    ])
+}
+
+fn dozenal_mode() -> bool {
+    std::env::var_os("INKSURF_DOZENAL").is_some()
+}
+
+/// Whether the once-per-night solar-midnight deep-clean runs (set INKSURF_DEEP_CLEAN). Off by default: normal operation already exercises every particle daily (the curve slides past every pixel and the day/night invert pass sweeps the seam across all columns), so there's nothing to un-stick. Kept as an opt-in for unusual situations — long static displays, observed ghosting.
+fn deep_clean_enabled() -> bool {
+    std::env::var_os("INKSURF_DEEP_CLEAN").is_some()
+}
+
+/// Convert a wall-clock time to its (hi, lo) dozenal-symbol indices, rounded to the nearest 10-minute mark (so 23:55:00-00:04:59 → ZilZil, 00:05:00-00:14:59 → ZilZila, etc.). Wraps cleanly at midnight.
+fn dozenal_indices(hour: u32, minute: u32) -> (usize, usize) {
+    let counter = ((hour * 60 + minute + 5) / 10) % 144;
+    ((counter / 12) as usize, (counter % 12) as usize)
+}
+
+/// Active label glyph height for layout math.
+fn label_glyph_h() -> usize {
+    if dozenal_mode() { DOZENAL_GLYPH_H } else { GLYPH_H }
 }
 
 fn invert_code(c: u8) -> u8 {
@@ -98,6 +146,7 @@ fn invert_code(c: u8) -> u8 {
 
 #[derive(Copy, Clone)]
 enum TextAnchor {
+    #[allow(dead_code)]
     Center,
     #[allow(dead_code)]
     Left,
@@ -135,7 +184,7 @@ fn draw_text(codes: &mut [u8], text: &str, anchor_x: i32, top_y: i32, anchor: Te
     let mut cursor_x = start_x;
     for ch in text.chars() {
         let Some(g) = gs.get(&ch) else { continue; };
-        for gy in 0..GLYPH_H as i32 {
+        for gy in 0..g.height as i32 {
             let py = top_y + gy;
             if py < 0 || py >= PANEL_H as i32 { continue; }
             for gx in 0..g.width as i32 {
@@ -147,6 +196,42 @@ fn draw_text(codes: &mut [u8], text: &str, anchor_x: i32, top_y: i32, anchor: Te
             }
         }
         cursor_x += g.width as i32 + GLYPH_KERN;
+    }
+}
+
+/// Stamp a 2-symbol dozenal label into `codes`. The HI symbol's right edge
+/// sits at `anchor_x - 1`, the LO symbol's left edge at `anchor_x + 1`,
+/// leaving the 1-px column at `anchor_x` untouched so the marker line shows
+/// thru as the visual gap.
+///
+/// Leading/trailing Zils (the dozenal zero, index 0) are omitted by convention — just like writing `5` instead of `5.0`. At 02:00 only "Zila" shows on the left; at 00:10 only "Zila" shows on the right; at exactly midnight (00:00 → ZilZil) nothing renders. The line position disambiguates the two single-glyph cases.
+fn draw_dozenal_label(codes: &mut [u8], hi: usize, lo: usize, anchor_x: i32, top_y: i32, color: u8) {
+    let dgs = dozenal_glyphs();
+    let stamp = |codes: &mut [u8], g: &Glyph, left: i32| {
+        for gy in 0..g.height as i32 {
+            let py = top_y + gy;
+            if py < 0 || py >= PANEL_H as i32 { continue; }
+            for gx in 0..g.width as i32 {
+                let px = left + gx;
+                if px < 0 || px >= PANEL_W as i32 { continue; }
+                if g.bits[gy as usize * g.width + gx as usize] != 0 {
+                    codes[py as usize * PANEL_W + px as usize] = color;
+                }
+            }
+        }
+    };
+    // First digit always renders. If the second is Zil it gets dropped and
+    // the lone first digit centers across the marker line — midnight (both
+    // Zil) therefore renders an explicit "Zil" sitting on the line.
+    if lo == 0 {
+        let g = &dgs[hi];
+        let left = anchor_x - g.width as i32 / 2;
+        stamp(codes, g, left);
+    } else {
+        let g_hi = &dgs[hi];
+        let g_lo = &dgs[lo];
+        stamp(codes, g_hi, anchor_x - g_hi.width as i32);
+        stamp(codes, g_lo, anchor_x + 1);
     }
 }
 
@@ -175,33 +260,74 @@ const YELLOW: u8 = 0b10;
 #[allow(dead_code)]
 const RED:    u8 = 0b11;
 
-// Refresh cadence — pick a fresh random interval each cycle inside this
-// window so the panel updates don't land on identical wall-clock minutes
-// hour after hour.
+// Refresh cadence depends on the time edition (see `dozenal_mode`):
+//
+//   Decimal (classic, default): a fresh random interval each cycle inside the
+//   7–9 min window, so panel updates don't land on identical wall-clock
+//   minutes hour after hour.
+//
+//   Dozenal: aligned to local-clock minutes ending in 5 (HH:05, HH:15, …).
+//   That matches the dozenal odometer's 10-min granularity exactly — the
+//   rounded-to-nearest counter flips at HH:X5, and that's when the panel does.
 const TICK_MIN_SECS: u64 = 7 * 60;
 const TICK_MAX_SECS: u64 = 9 * 60;
 
 fn main() -> Result<()> {
-    eprintln!("tide-display: station {STATION_ID}, refresh every {}–{}s", TICK_MIN_SECS, TICK_MAX_SECS);
+    if dozenal_mode() {
+        eprintln!("tide-display: station {STATION_ID}, ticking on every local HH:X5");
+    } else {
+        eprintln!("tide-display: station {STATION_ID}, refresh every {TICK_MIN_SECS}–{TICK_MAX_SECS}s");
+    }
+    // Last solar midnight we ran a deep-clean for. In-memory only: a daemon restart resets this to None, so the first tick after a restart will deep-clean once — harmless (it just clears ghosting).
+    let mut last_cleaned: Option<DateTime<Utc>> = None;
     loop {
-        let errored = match tick() {
+        let errored = match tick(&mut last_cleaned) {
             Ok(()) => false,
             Err(e) => {
                 eprintln!("[{}] cycle error: {e:#}", Local::now().format("%H:%M:%S"));
                 true
             }
         };
-        let sleep_secs = if errored {
-            30
+        let now = Utc::now();
+        if errored {
+            eprintln!("[{}] sleeping 30s", Local::now().format("%H:%M:%S"));
+            std::thread::sleep(StdDuration::from_secs(30));
+        } else if dozenal_mode() {
+            let next = next_aligned_tick(now);
+            let dur = (next - now).num_seconds().max(0) as u64;
+            eprintln!(
+                "[{}] sleeping until {} ({}s)",
+                Local::now().format("%H:%M:%S"),
+                next.with_timezone(&Pacific).format("%H:%M:%S"),
+                dur,
+            );
+            std::thread::sleep(StdDuration::from_secs(dur));
         } else {
-            fastrand::u64(TICK_MIN_SECS..=TICK_MAX_SECS)
-        };
-        eprintln!("[{}] sleeping {sleep_secs}s", Local::now().format("%H:%M:%S"));
-        std::thread::sleep(StdDuration::from_secs(sleep_secs));
+            let dur = fastrand::u64(TICK_MIN_SECS..=TICK_MAX_SECS);
+            eprintln!("[{}] sleeping {dur}s", Local::now().format("%H:%M:%S"));
+            std::thread::sleep(StdDuration::from_secs(dur));
+        }
     }
 }
 
-fn tick() -> Result<()> {
+/// Next instant strictly after `now` whose local-time minute ends in 5.
+fn next_aligned_tick(now: DateTime<Utc>) -> DateTime<Utc> {
+    let mut t = now
+        .with_timezone(&Pacific)
+        .with_second(0)
+        .unwrap()
+        .with_nanosecond(0)
+        .unwrap();
+    while t.with_timezone(&Utc) <= now {
+        t = t + Duration::minutes(1);
+    }
+    while t.minute() % 10 != 5 {
+        t = t + Duration::minutes(1);
+    }
+    t.with_timezone(&Utc)
+}
+
+fn tick(last_cleaned: &mut Option<DateTime<Utc>>) -> Result<()> {
     if std::env::var_os("TIDE_CAL").is_some() {
         let canvas = calibration_canvas();
         let fb = pack_to_chip(&canvas);
@@ -210,17 +336,24 @@ fn tick() -> Result<()> {
     }
     let now = Utc::now();
 
-    // Run a deep-clean color cycle if we just crossed solar midnight within
-    // the last tick — exercises all four ink particles to clear ghosting.
-    // Use TICK_MAX_SECS so the longest possible gap between ticks still
-    // catches the event.
-    let solar_mid = most_recent_solar_midnight(now);
-    let since = (now - solar_mid).num_seconds();
-    if since >= 0 && since < TICK_MAX_SECS as i64 {
-        eprintln!("  solar midnight crossed ({}); running deep clean",
-            solar_mid.with_timezone(&Pacific).format("%Y-%m-%d %H:%M:%S %Z"));
-        if let Err(e) = deep_clean() {
-            eprintln!("  deep clean error: {e:#}");
+    // Optional once-per-night solar-midnight deep-clean (see deep_clean_enabled;
+    // off by default). Event-based: the most recent solar midnight is a per-night
+    // identifier — when it differs from the one we last cleaned for, a new night
+    // has begun, so cycle all four ink particles to clear ghosting. Cadence-
+    // independent (no time window to miss) and fires exactly once per night.
+    //
+    // State is in-memory only, so a daemon restart resets it to None and the
+    // first tick deep-cleans once. That's intentional and harmless — a fresh
+    // start is as good a time as any to clear ghosting.
+    if deep_clean_enabled() {
+        let solar_mid = most_recent_solar_midnight(now);
+        if *last_cleaned != Some(solar_mid) {
+            eprintln!("  solar midnight crossed ({}); running deep clean",
+                solar_mid.with_timezone(&Pacific).format("%Y-%m-%d %H:%M:%S %Z"));
+            if let Err(e) = deep_clean() {
+                eprintln!("  deep clean error: {e:#}");
+            }
+            *last_cleaned = Some(solar_mid);
         }
     }
 
@@ -231,17 +364,11 @@ fn tick() -> Result<()> {
     Ok(())
 }
 
-/// Solar midnight = midpoint between yesterday's sunset and today's sunrise. Returns None if the underlying sunrise/sunset computation hits an edge case (e.g., polar day / night where the sun doesn't rise or set — irrelevant for our 47° N location but cleanly handled).
+/// Solar midnight = midpoint between yesterday's sunset and today's sunrise. Returns None only if the midpoint timestamp can't be represented as a `DateTime` (not reachable for real dates).
 fn solar_midnight_for_date(date: chrono::NaiveDate) -> Option<DateTime<Utc>> {
     let yesterday = date.checked_sub_days(chrono::Days::new(1))?;
-    let (_, ss) = sunrise::sunrise_sunset(
-        SUN_LAT, SUN_LON,
-        yesterday.year(), yesterday.month() as u32, yesterday.day() as u32,
-    );
-    let (sr, _) = sunrise::sunrise_sunset(
-        SUN_LAT, SUN_LON,
-        date.year(), date.month() as u32, date.day() as u32,
-    );
+    let (_, ss) = sun_events_for(yesterday);
+    let (sr, _) = sun_events_for(date);
     DateTime::<Utc>::from_timestamp((ss + sr) / 2, 0)
 }
 
@@ -258,7 +385,7 @@ fn most_recent_solar_midnight(now: DateTime<Utc>) -> DateTime<Utc> {
     }
 }
 
-/// Cycle the panel through all four BWRY ink colors as a ghosting-clear. Each fill triggers a full chip refresh (~60s), so this blocks for ~4 min.
+/// Cycle the panel thru all four BWRY ink colors as a ghosting-clear. Each fill triggers a full chip refresh (~60s), so this blocks for ~4 min.
 fn deep_clean() -> Result<()> {
     let mut port = serialport::new(DEVICE, 115_200)
         .timeout(StdDuration::from_secs(2))
@@ -422,11 +549,13 @@ fn render(samples: &[Sample], now: DateTime<Utc>) -> Result<Canvas> {
         }
     }
 
-    // Hi/Lo tide markers (RED). Marker lines span the full panel height; labels sit OPPOSITE the curve at that x — HIGH tide labels in the bottom third (chart peak is at top), LOW tide labels in the top third (chart trough is at bottom). Colon ':' is anchored on the line so it visually melts into it.
+    // Hi/Lo tide markers (RED). Marker lines span the full panel height; labels sit OPPOSITE the curve at that x — HIGH tide labels in the bottom third (chart peak is at top), LOW tide labels in the top third (chart trough is at bottom). Colon ':' is anchored on the line so it visually melts into it (decimal mode); in dozenal mode the 1-px marker column becomes the gap between the two dozenal symbols.
     let extrema = find_extrema(samples, now);
-    let top_third_y:    i32 = (PANEL_H as i32 / 3 - GLYPH_H as i32) / 2;
-    let bottom_third_y: i32 = PANEL_H as i32 - (PANEL_H as i32 / 3 + GLYPH_H as i32) / 2;
-    let center_y:       i32 = (PANEL_H as i32 - GLYPH_H as i32) / 2;
+    let lh = label_glyph_h() as i32;
+    let top_third_y:    i32 = (PANEL_H as i32 / 3 - lh) / 2;
+    let bottom_third_y: i32 = PANEL_H as i32 - (PANEL_H as i32 / 3 + lh) / 2;
+    let center_y:       i32 = (PANEL_H as i32 - lh) / 2;
+    let dozenal = dozenal_mode();
 
     for (ev, kind) in &extrema {
         let dt = (ev.when - now).num_seconds() as f32;
@@ -437,11 +566,18 @@ fn render(samples: &[Sample], now: DateTime<Utc>) -> Result<Canvas> {
             ExtremumKind::High => bottom_third_y,
             ExtremumKind::Low  => top_third_y,
         };
-        // Line in two segments — above and below the label cell — so the colon and digit interiors don't get a red bar painted through them.
-        draw_v_line_split(&mut codes, x, label_y, GLYPH_H as i32, RED);
+        // Line in two segments — above and below the label cell — so the label interior doesn't get a bar painted thru it.
+        // Add a 2-px buffer above and below the text band so the line break
+        // doesn't crowd the glyphs.
+        draw_v_line_split(&mut codes, x, label_y - 2, lh + 4, RED);
         let local = ev.when.with_timezone(&Pacific);
-        let label = local.format("%H:%M").to_string();
-        draw_text(&mut codes, &label, x, label_y, TextAnchor::AlignChar(':'), RED);
+        if dozenal {
+            let (hi, lo) = dozenal_indices(local.hour(), local.minute());
+            draw_dozenal_label(&mut codes, hi, lo, x, label_y, RED);
+        } else {
+            let label = local.format("%H:%M").to_string();
+            draw_text(&mut codes, &label, x, label_y, TextAnchor::AlignChar(':'), RED);
+        }
     }
 
     // Hourly tick marks (1 px BLACK in day style, top + bottom edges). Painted before the now line + invert pass so they invert with the column scheme automatically.
@@ -455,11 +591,19 @@ fn render(samples: &[Sample], now: DateTime<Utc>) -> Result<Canvas> {
         let window_end = now + Duration::hours(12);
         let mut t = t_hour.with_timezone(&Utc);
         while t < window_end {
+            let local_t = t.with_timezone(&Pacific);
+            let hour = local_t.hour();
+            // Dozenal mode: only paint ticks at dozenal-hour boundaries (every
+            // 2 normal hours) — drop the odd-numbered hours entirely.
+            if dozenal && hour % 2 != 0 {
+                t = t + Duration::hours(1);
+                continue;
+            }
             let dt = (t - now).num_seconds() as f32;
             let frac = dt / (24.0 * 3600.0);
             let x = (PANEL_W as f32 / 2.0 + frac * PANEL_W as f32).round() as i32;
             // Local midnight gets a taller (2 px) tick to anchor day boundaries.
-            let tick_h: i32 = if t.with_timezone(&Pacific).hour() == 0 { 2 } else { 1 };
+            let tick_h: i32 = if hour == 0 { 2 } else { 1 };
             // Skip the leftmost / rightmost 3 columns — reserved for the moon and solar-year cycle indicators.
             if x >= 3 && x < PANEL_W as i32 - 3 {
                 for dy in 0..tick_h {
@@ -473,10 +617,15 @@ fn render(samples: &[Sample], now: DateTime<Utc>) -> Result<Canvas> {
 
     // "Now" marker (BLACK in day style; the column-invert pass below will flip it to WHITE in any night columns automatically).
     let now_x = (PANEL_W / 2) as i32;
-    draw_v_line_split(&mut codes, now_x, center_y, GLYPH_H as i32, BLACK);
+    draw_v_line_split(&mut codes, now_x, center_y - 2, lh + 4, BLACK);
     let now_local = now.with_timezone(&Pacific);
-    let now_label = now_local.format("%H:%M").to_string();
-    draw_text(&mut codes, &now_label, now_x, center_y, TextAnchor::AlignChar(':'), BLACK);
+    if dozenal {
+        let (hi, lo) = dozenal_indices(now_local.hour(), now_local.minute());
+        draw_dozenal_label(&mut codes, hi, lo, now_x, center_y, BLACK);
+    } else {
+        let now_label = now_local.format("%H:%M").to_string();
+        draw_text(&mut codes, &now_label, now_x, center_y, TextAnchor::AlignChar(':'), BLACK);
+    }
 
     // Final pass: invert every column whose time is in the dark hours. Maps BLACK↔WHITE and RED↔YELLOW — that's the whole night theme.
     for x in 0..PANEL_W {
@@ -494,8 +643,14 @@ fn render(samples: &[Sample], now: DateTime<Utc>) -> Result<Canvas> {
         let frac = dt / (24.0 * 3600.0);
         let x_f = PANEL_W as f32 / 2.0 + frac * PANEL_W as f32;
         if x_f < 0.0 || x_f >= PANEL_W as f32 { continue; }
-        let label = ev_time.with_timezone(&Pacific).format("%H:%M").to_string();
-        draw_text_rotated_invert(&mut codes, &label, x_f, panel_mid_y, kind);
+        let local = ev_time.with_timezone(&Pacific);
+        if dozenal {
+            let (hi, lo) = dozenal_indices(local.hour(), local.minute());
+            draw_dozenal_rotated_invert(&mut codes, hi, lo, x_f, panel_mid_y, kind);
+        } else {
+            let label = local.format("%H:%M").to_string();
+            draw_text_rotated_invert(&mut codes, &label, x_f, panel_mid_y, kind);
+        }
     }
 
     // Moon (left edge) + solar year (right edge) cycle indicators. 2-pixel diagonal arrow most of the time; 2-pixel horizontal line within 12h of a max/min event. All pixels invert what's under them.
@@ -590,6 +745,17 @@ enum SunEvent {
     Sunset,
 }
 
+/// Sunrise and sunset (Unix seconds) at Southworth WA for a local date. Wraps the `sunrise` crate's `SolarDay` API in one place so call sites stay terse.
+fn sun_events_for(date: chrono::NaiveDate) -> (i64, i64) {
+    let coords = sunrise::Coordinates::new(SUN_LAT, SUN_LON)
+        .expect("SUN_LAT/SUN_LON are valid coordinates");
+    let day = sunrise::SolarDay::new(coords, date);
+    (
+        day.event_time(sunrise::SolarEvent::Sunrise).timestamp(),
+        day.event_time(sunrise::SolarEvent::Sunset).timestamp(),
+    )
+}
+
 /// All sunrise/sunset events that fall inside the ±12h visible window centered on `now`. We probe yesterday, today, and tomorrow to catch whichever events land in the window regardless of what time of day it is.
 fn find_sun_events(now: DateTime<Utc>) -> Vec<(DateTime<Utc>, SunEvent)> {
     let mut out = Vec::new();
@@ -598,9 +764,7 @@ fn find_sun_events(now: DateTime<Utc>) -> Vec<(DateTime<Utc>, SunEvent)> {
     let local_today = now.with_timezone(&Pacific).date_naive();
     for day_offset in -1..=1i64 {
         let d = local_today + chrono::Duration::days(day_offset);
-        let (sr_ts, ss_ts) = sunrise::sunrise_sunset(
-            SUN_LAT, SUN_LON, d.year(), d.month() as u32, d.day() as u32,
-        );
+        let (sr_ts, ss_ts) = sun_events_for(d);
         for (ts, kind) in [(sr_ts, SunEvent::Sunrise), (ss_ts, SunEvent::Sunset)] {
             if let Some(t) = DateTime::<Utc>::from_timestamp(ts, 0) {
                 if t >= win_start && t < win_end { out.push((t, kind)); }
@@ -619,50 +783,107 @@ fn draw_text_rotated_invert(
     event: SunEvent,
 ) {
     let gs = glyphs();
-    let widths: Vec<i32> = text.chars()
-        .map(|ch| gs.get(&ch).map(|g| g.width as i32).unwrap_or(0))
-        .collect();
+    let glyphs_in_label: Vec<&Glyph> = text.chars().filter_map(|c| gs.get(&c)).collect();
+    if glyphs_in_label.is_empty() { return; }
+    let widths: Vec<i32> = glyphs_in_label.iter().map(|g| g.width as i32).collect();
     let count = widths.len() as i32;
     // After rotation each char takes its original width as new vertical height.
     let total_h: i32 = widths.iter().sum::<i32>() + GLYPH_KERN * (count - 1).max(0);
     let block_top = center_y - total_h / 2;
     let block_bot = block_top + total_h;
 
-    let rot_w = GLYPH_H as i32; // 12 px wide after rotation
-    // Place the cell so its visual center sits on the seam (the boundary between the last night column and the first day column). For sunrise at `x_f`, the seam is at `floor(x_f) + 0.5` when x_f is strictly between integers, and at `x_f - 0.5` when x_f is exactly an integer. `ceil(x_f) - rot_w/2` matches both cases.
+    // All glyphs in a single label share the same source height; rotated width
+    // is therefore uniform too. Take it from any glyph in the label.
+    let glyph_h = glyphs_in_label[0].height as i32;
+    let rot_w = glyph_h;
     let glyph_left = center_x.ceil() as i32 - rot_w / 2;
 
-    // Sunrise: first char of `text` (e.g. '0' of "05:14") sits at the BOTTOM. Sunset: first char sits at the TOP.
-    let mut cursor_bottom = block_bot; // bottom edge of next sunrise glyph
-    let mut cursor_top    = block_top; // top edge of next sunset glyph
+    let mut cursor_bottom = block_bot;
+    let mut cursor_top    = block_top;
 
-    for ch in text.chars() {
-        let Some(g) = gs.get(&ch) else { continue; };
+    for g in glyphs_in_label {
         let rot_h = g.width as i32;
-        let (glyph_top, glyph_bot_excl) = match event {
-            SunEvent::Sunrise => (cursor_bottom - rot_h, cursor_bottom),
-            SunEvent::Sunset  => (cursor_top, cursor_top + rot_h),
+        let glyph_top = match event {
+            SunEvent::Sunrise => cursor_bottom - rot_h,
+            SunEvent::Sunset  => cursor_top,
         };
 
-        for src_y in 0..GLYPH_H as i32 {
+        for src_y in 0..g.height as i32 {
             for src_x in 0..g.width as i32 {
                 if g.bits[src_y as usize * g.width + src_x as usize] == 0 { continue; }
                 let (rx, ry) = match event {
                     // CCW: (src_x, src_y) → (src_y, src_w - 1 - src_x)
                     SunEvent::Sunrise => (src_y, g.width as i32 - 1 - src_x),
                     // CW:  (src_x, src_y) → (src_h - 1 - src_y, src_x)
-                    SunEvent::Sunset  => (GLYPH_H as i32 - 1 - src_y, src_x),
+                    SunEvent::Sunset  => (g.height as i32 - 1 - src_y, src_x),
                 };
                 let px = glyph_left + rx;
                 let py = glyph_top + ry;
                 if px < 0 || px >= PANEL_W as i32 { continue; }
                 if py < 0 || py >= PANEL_H as i32 { continue; }
-                let _ = glyph_bot_excl; // keep var alive for clarity in code review
                 let idx = py as usize * PANEL_W + px as usize;
                 codes[idx] = invert_code(codes[idx]);
             }
         }
 
+        match event {
+            SunEvent::Sunrise => cursor_bottom -= rot_h + GLYPH_KERN,
+            SunEvent::Sunset  => cursor_top    += rot_h + GLYPH_KERN,
+        }
+    }
+}
+
+/// Rotated 2-glyph dozenal label for a sun event. Sunrise = bottom-up (CCW),
+/// sunset = top-down (CW). Each "on" glyph pixel inverts the underlying pixel.
+/// Leading / trailing Zils are dropped just like the horizontal labels; the
+/// midnight all-Zil corner case renders a single explicit Zil.
+fn draw_dozenal_rotated_invert(
+    codes: &mut [u8],
+    hi: usize,
+    lo: usize,
+    center_x: f32,
+    center_y: i32,
+    event: SunEvent,
+) {
+    let dgs = dozenal_glyphs();
+    // First digit always renders; drop the second if it's Zil.
+    let mut glyphs_in_label: Vec<&Glyph> = vec![&dgs[hi]];
+    if lo != 0 { glyphs_in_label.push(&dgs[lo]); }
+
+    let count = glyphs_in_label.len() as i32;
+    let total_h: i32 = glyphs_in_label.iter().map(|g| g.width as i32).sum::<i32>()
+        + GLYPH_KERN * (count - 1).max(0);
+    let block_top = center_y - total_h / 2;
+    let block_bot = block_top + total_h;
+
+    let glyph_h = glyphs_in_label[0].height as i32;
+    let rot_w = glyph_h;
+    let glyph_left = center_x.ceil() as i32 - rot_w / 2;
+
+    let mut cursor_bottom = block_bot;
+    let mut cursor_top    = block_top;
+
+    for g in glyphs_in_label.iter().copied() {
+        let rot_h = g.width as i32;
+        let glyph_top = match event {
+            SunEvent::Sunrise => cursor_bottom - rot_h,
+            SunEvent::Sunset  => cursor_top,
+        };
+        for src_y in 0..g.height as i32 {
+            for src_x in 0..g.width as i32 {
+                if g.bits[src_y as usize * g.width + src_x as usize] == 0 { continue; }
+                let (rx, ry) = match event {
+                    SunEvent::Sunrise => (src_y, g.width as i32 - 1 - src_x),
+                    SunEvent::Sunset  => (g.height as i32 - 1 - src_y, src_x),
+                };
+                let px = glyph_left + rx;
+                let py = glyph_top + ry;
+                if px < 0 || px >= PANEL_W as i32 { continue; }
+                if py < 0 || py >= PANEL_H as i32 { continue; }
+                let idx = py as usize * PANEL_W + px as usize;
+                codes[idx] = invert_code(codes[idx]);
+            }
+        }
         match event {
             SunEvent::Sunrise => cursor_bottom -= rot_h + GLYPH_KERN,
             SunEvent::Sunset  => cursor_top    += rot_h + GLYPH_KERN,
@@ -755,10 +976,7 @@ fn draw_cycle_indicator(codes: &mut [u8], left_side: bool, kind: CycleEventKind,
 fn is_night(t_utc: DateTime<Utc>) -> bool {
     let local = t_utc.with_timezone(&Pacific);
     let date = local.date_naive();
-    let (sunrise_ts, sunset_ts) = sunrise::sunrise_sunset(
-        SUN_LAT, SUN_LON,
-        date.year(), date.month() as u32, date.day() as u32,
-    );
+    let (sunrise_ts, sunset_ts) = sun_events_for(date);
     let t_ts = t_utc.timestamp();
     t_ts < sunrise_ts || t_ts >= sunset_ts
 }
@@ -805,7 +1023,7 @@ fn pack_to_chip(canvas: &Canvas) -> Vec<u8> {
 const MODE_JD79667: u8 = 1;
 
 fn send_to_panel(fb: &[u8]) -> Result<()> {
-    // 90 s write timeout: long enough to ride through a firmware boot/refresh window where the CDC buffer fills before the chip starts consuming bytes.
+    // 90 s write timeout: long enough to ride thru a firmware boot/refresh window where the CDC buffer fills before the chip starts consuming bytes.
     let mut port = serialport::new(DEVICE, 115_200)
         .timeout(StdDuration::from_secs(90))
         .open()

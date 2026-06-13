@@ -1,0 +1,35 @@
+[Unit]
+Description=inksurf tide display daemon
+Documentation=https://github.com/nickspiker/inksurf
+After=network-online.target
+Wants=network-online.target
+
+# Don't rate-limit restarts — we want it to come back no matter how often it dies.
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+
+# Edition: leave commented for the classic decimal HH:MM clock (random 7–9 min
+# refresh); uncomment for the dozenal odometer (aligned HH:X5 refresh).
+#Environment=INKSURF_DOZENAL=1
+
+# Uncomment to re-enable the once-per-night solar-midnight deep-clean (K→Y→R→W).
+# Off by default — normal operation already exercises every ink particle daily.
+#Environment=INKSURF_DEEP_CLEAN=1
+
+ExecStart=/usr/local/bin/inksurf
+
+Restart=always
+RestartSec=10
+
+# Run as the same user that has dialout group + USB access. Adjust if you
+# install the binary elsewhere or run as a dedicated user.
+User=nick
+
+# Journal everything for `journalctl -u inksurf` access.
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
