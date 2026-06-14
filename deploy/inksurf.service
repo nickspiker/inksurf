@@ -12,7 +12,7 @@ Type=simple
 
 # Edition: leave commented for the classic decimal HH:MM clock (random 7–9 min
 # refresh); uncomment for the dozenal odometer (aligned HH:X5 refresh).
-#Environment=INKSURF_DOZENAL=1
+Environment=INKSURF_DOZENAL=1
 
 # Uncomment to re-enable the once-per-night solar-midnight deep-clean (K→Y→R→W).
 # Off by default — normal operation already exercises every ink particle daily.

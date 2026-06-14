@@ -294,14 +294,20 @@ fn main() -> Result<()> {
             std::thread::sleep(StdDuration::from_secs(30));
         } else if dozenal_mode() {
             let next = next_aligned_tick(now);
-            let dur = (next - now).num_seconds().max(0) as u64;
+            // Sleep with sub-second precision to the target, plus a 250 ms
+            // margin past the boundary. The OS sleep can return slightly early;
+            // without the margin we'd re-enter tick() with the wall clock still
+            // in the previous minute (e.g. 18:04:59.9), render the wrong dozenal
+            // symbol, then immediately tick again — a double-tick at every
+            // boundary that showed the stale label on the panel.
+            let dur_ms = (next - now).num_milliseconds().max(0) as u64 + 250;
             eprintln!(
-                "[{}] sleeping until {} ({}s)",
+                "[{}] sleeping until {} ({:.1}s)",
                 Local::now().format("%H:%M:%S"),
                 next.with_timezone(&Pacific).format("%H:%M:%S"),
-                dur,
+                dur_ms as f64 / 1000.0,
             );
-            std::thread::sleep(StdDuration::from_secs(dur));
+            std::thread::sleep(StdDuration::from_millis(dur_ms));
         } else {
             let dur = fastrand::u64(TICK_MIN_SECS..=TICK_MAX_SECS);
             eprintln!("[{}] sleeping {dur}s", Local::now().format("%H:%M:%S"));
