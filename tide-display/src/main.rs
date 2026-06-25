@@ -236,7 +236,7 @@ fn draw_dozenal_label(codes: &mut [u8], hi: usize, lo: usize, anchor_x: i32, top
 }
 
 const STATION_ID: &str = "9445958"; // Bremerton, WA
-const DEVICE: &str = "/dev/ttyACM0";
+const DEVICE: &str = "/dev/inksurf"; // stable udev symlink (deploy/99-inksurf.rules); falls back nowhere, so install the rule
 
 // Sunrise/sunset location — Southworth, WA (close enough to Bremerton for solar timing; same time zone, same minute-of-sunrise to within seconds).
 const SUN_LAT: f64 = 47.5126;

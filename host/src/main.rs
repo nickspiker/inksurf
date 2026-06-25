@@ -16,7 +16,7 @@ const FB_BYTES: usize = ROW_BYTES * PANEL_H as usize; // 5624
 #[derive(Parser)]
 #[command(name = "eink-host", about = "Drive the ferros eink board")]
 struct Cli {
-    #[arg(short, long, default_value = "/dev/ttyACM0")]
+    #[arg(short, long, default_value = "/dev/inksurf")]
     device: String,
 
     #[command(subcommand)]

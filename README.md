@@ -69,18 +69,14 @@ Today the daemon is hard-coded for **Bremerton WA** tides (NOAA station 9445958)
 1. Edit `tide-display/src/main.rs` and change `STATION_ID`, `SUN_LAT`, `SUN_LON`.
 2. Replace `TIDE_MIN_FT` / `TIDE_MAX_FT` with your station's HAT/LAT bounds in MLLW. Fetch from `https://api.tidesandcurrents.noaa.gov/mdapi/prod/webapi/stations/<STATION>/datums.json` and convert from NAVD88 by subtracting the station's MLLW→NAVD88 offset.
 
-The ModemManager-blocking udev rule (Fedora and most desktop Linuxes need this; the firmware enumerates as a CDC serial port and ModemManager will probe it with AT commands):
-
-```
-# /etc/udev/rules.d/99-inksurf.rules
-ATTRS{idVendor}=="1209", ATTRS{idProduct}=="000d", ENV{ID_MM_DEVICE_IGNORE}="1"
-```
+The udev rule does two things: gives the panel a stable `/dev/inksurf` symlink (the daemon and `eink-host` default to it, so it doesn't matter whether the kernel enumerates the board as `ttyACM0`, `ttyACM1`, … — that ordering changes across reboots) and sets `ID_MM_DEVICE_IGNORE` so ModemManager doesn't probe the CDC port with AT commands (Fedora and most desktop Linuxes need this). Install [`deploy/99-inksurf.rules`](deploy/99-inksurf.rules):
 
 ```sh
-sudo udevadm control --reload
+sudo cp deploy/99-inksurf.rules /etc/udev/rules.d/
+sudo udevadm control --reload && sudo udevadm trigger
 ```
 
-Then unplug / replug the panel.
+Then unplug / replug the panel and confirm `/dev/inksurf` exists.
 
 ## How it works
 

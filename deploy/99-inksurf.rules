@@ -1,0 +1,11 @@
+# inksurf e-ink panel (ferros "eink-multi", pid.codes test VID:PID).
+#
+# 1. Stable /dev/inksurf symlink so the daemon doesn't care whether the kernel
+#    enumerates the panel as ttyACM0, ttyACM1, … (changes across reboots).
+# 2. ID_MM_DEVICE_IGNORE so ModemManager doesn't probe the CDC port with AT
+#    commands and corrupt the panel protocol.
+#
+# Install: sudo cp deploy/99-inksurf.rules /etc/udev/rules.d/
+#          sudo udevadm control --reload && sudo udevadm trigger
+# then unplug / replug the panel.
+SUBSYSTEM=="tty", ATTRS{idVendor}=="1209", ATTRS{idProduct}=="000d", SYMLINK+="inksurf", ENV{ID_MM_DEVICE_IGNORE}="1"
