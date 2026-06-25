@@ -281,37 +281,45 @@ fn main() -> Result<()> {
     // Last solar midnight we ran a deep-clean for. In-memory only: a daemon restart resets this to None, so the first tick after a restart will deep-clean once — harmless (it just clears ghosting).
     let mut last_cleaned: Option<DateTime<Utc>> = None;
     loop {
-        let errored = match tick(&mut last_cleaned) {
+        // Decide this frame's display window *before* rendering so we can draw
+        // the time at the window's midpoint. A frame painted at wake-time would
+        // be exact for an instant and then drift stale until the next refresh;
+        // rendering for the midpoint instead splits the error symmetrically
+        // (±½ window) over the time it's actually on screen. The window end is
+        // also exactly when we sleep until.
+        let now = Utc::now();
+        let window_end = if dozenal_mode() {
+            next_aligned_tick(now)
+        } else {
+            now + Duration::seconds(fastrand::u64(TICK_MIN_SECS..=TICK_MAX_SECS) as i64)
+        };
+        let render_time = now + (window_end - now) / 2;
+
+        let errored = match tick(&mut last_cleaned, render_time) {
             Ok(()) => false,
             Err(e) => {
                 eprintln!("[{}] cycle error: {e:#}", Local::now().format("%H:%M:%S"));
                 true
             }
         };
-        let now = Utc::now();
         if errored {
             eprintln!("[{}] sleeping 30s", Local::now().format("%H:%M:%S"));
             std::thread::sleep(StdDuration::from_secs(30));
-        } else if dozenal_mode() {
-            let next = next_aligned_tick(now);
-            // Sleep with sub-second precision to the target, plus a 250 ms
+        } else {
+            // Sleep to window_end with sub-second precision, plus a 250 ms
             // margin past the boundary. The OS sleep can return slightly early;
-            // without the margin we'd re-enter tick() with the wall clock still
-            // in the previous minute (e.g. 18:04:59.9), render the wrong dozenal
-            // symbol, then immediately tick again — a double-tick at every
-            // boundary that showed the stale label on the panel.
-            let dur_ms = (next - now).num_milliseconds().max(0) as u64 + 250;
+            // without the margin we'd re-enter the loop with the wall clock
+            // still before the boundary, recompute a ~0-length window, and
+            // double-tick (which once showed a stale dozenal label on the panel).
+            let dur_ms = (window_end - Utc::now()).num_milliseconds().max(0) as u64 + 250;
             eprintln!(
-                "[{}] sleeping until {} ({:.1}s)",
+                "[{}] rendered for {}, sleeping until {} ({:.1}s)",
                 Local::now().format("%H:%M:%S"),
-                next.with_timezone(&Pacific).format("%H:%M:%S"),
+                render_time.with_timezone(&Pacific).format("%H:%M:%S"),
+                window_end.with_timezone(&Pacific).format("%H:%M:%S"),
                 dur_ms as f64 / 1000.0,
             );
             std::thread::sleep(StdDuration::from_millis(dur_ms));
-        } else {
-            let dur = fastrand::u64(TICK_MIN_SECS..=TICK_MAX_SECS);
-            eprintln!("[{}] sleeping {dur}s", Local::now().format("%H:%M:%S"));
-            std::thread::sleep(StdDuration::from_secs(dur));
         }
     }
 }
@@ -333,7 +341,11 @@ fn next_aligned_tick(now: DateTime<Utc>) -> DateTime<Utc> {
     t.with_timezone(&Utc)
 }
 
-fn tick(last_cleaned: &mut Option<DateTime<Utc>>) -> Result<()> {
+/// Render and push one frame. `render_time` is the instant the frame depicts —
+/// the midpoint of its on-screen window, not necessarily wall-clock now (see
+/// the main loop). The deep-clean check uses real now, since it's about "has a
+/// new night begun," not about what the frame shows.
+fn tick(last_cleaned: &mut Option<DateTime<Utc>>, render_time: DateTime<Utc>) -> Result<()> {
     if std::env::var_os("TIDE_CAL").is_some() {
         let canvas = calibration_canvas();
         let fb = pack_to_chip(&canvas);
@@ -363,8 +375,8 @@ fn tick(last_cleaned: &mut Option<DateTime<Utc>>) -> Result<()> {
         }
     }
 
-    let preds = fetch_predictions(now)?;
-    let canvas = render(&preds, now)?;
+    let preds = fetch_predictions(render_time)?;
+    let canvas = render(&preds, render_time)?;
     let fb = pack_to_chip(&canvas);
     send_to_panel(&fb)?;
     Ok(())
