@@ -654,6 +654,21 @@ fn render(samples: &[Sample], now: DateTime<Utc>) -> Result<Canvas> {
         }
     }
 
+    // Moon-visibility line: one inverted pixel per column, riding the very top
+    // row when the Moon is above the horizon at that column's time and the very
+    // bottom row when it's below. The square-wave jumps land exactly at moonrise
+    // and moonset. Inverts like the now line, so it reads against whatever
+    // day/night background is under it. Where an hour tick already painted this
+    // pixel BLACK, the invert flips it to WHITE — the tick recolors rather than
+    // vanishing, so both stay legible (invert_code is an involution, not a
+    // destructive XOR-to-background).
+    for x in 0..PANEL_W {
+        let up = moon_altitude_deg(time_at_x(x)) > 0.0;
+        let y = if up { 0 } else { PANEL_H - 1 };
+        let i = y * PANEL_W + x;
+        codes[i] = invert_code(codes[i]);
+    }
+
     // Vertical sunrise/sunset time labels — drawn after the column invert so pixels in night columns end up double-inverted (= day style) and pixels in day columns get inverted once. Either way the labels read as the opposite of whatever was painted beneath.
     let panel_mid_y = PANEL_H as i32 / 2;
     for (ev_time, kind) in find_sun_events(now) {
@@ -997,6 +1012,52 @@ fn is_night(t_utc: DateTime<Utc>) -> bool {
     let (sunrise_ts, sunset_ts) = sun_events_for(date);
     let t_ts = t_utc.timestamp();
     t_ts < sunrise_ts || t_ts >= sunset_ts
+}
+
+/// Geocentric altitude of the Moon (degrees above the horizon) at `t_utc`, seen
+/// from SUN_LAT/SUN_LON. Meeus low-precision lunar theory (a handful of the
+/// largest periodic terms) — accurate to ~0.1–0.3°, far finer than the panel's
+/// ~3.75 min/column resolution needs. Input is an absolute UTC instant; no
+/// timezone or DST enters the math. `> 0` means the Moon is up.
+///
+/// Unix epoch → J2000 (2000-01-01 12:00 UTC = Unix 946_728_000). Days since
+/// J2000 drive the mean elements; everything else is spherical trig.
+fn moon_altitude_deg(t_utc: DateTime<Utc>) -> f64 {
+    const J2000_UNIX: f64 = 946_728_000.0;
+    let d = (t_utc.timestamp() as f64 - J2000_UNIX) / 86_400.0;
+
+    let rad = |deg: f64| deg.to_radians();
+    let norm = |deg: f64| deg.rem_euclid(360.0);
+
+    // Moon mean elements (degrees), linear in d (Meeus, low precision).
+    let lp = norm(218.316 + 13.176396 * d); // mean longitude
+    let m  = norm(134.963 + 13.064993 * d); // mean anomaly
+    let f  = norm(93.272 + 13.229350 * d);  // argument of latitude
+
+    // Ecliptic longitude & latitude with the dominant periodic terms (degrees).
+    let lambda = lp
+        + 6.289 * rad(m).sin()
+        - 1.274 * rad(2.0 * (lp - norm(297.850 + 12.190749 * d)) - m).sin() // evection-ish (elongation D)
+        + 0.658 * rad(2.0 * (lp - norm(297.850 + 12.190749 * d))).sin()     // variation
+        - 0.186 * rad(norm(357.529 + 0.985600 * d)).sin();                  // solar mean anomaly
+    let beta = 5.128 * rad(f).sin() + 0.281 * rad(m + f).sin() - 0.278 * rad(f - m).sin();
+
+    // Ecliptic → equatorial (obliquity of the ecliptic, slowly varying).
+    let eps = rad(23.439 - 0.0000004 * d);
+    let (lam, bet) = (rad(lambda), rad(beta));
+    let ra = (lam.sin() * eps.cos() - bet.tan() * eps.sin()).atan2(lam.cos());
+    let dec = (bet.sin() * eps.cos() + bet.cos() * eps.sin() * lam.sin()).asin();
+
+    // Local hour angle: GMST (deg) + observer longitude − right ascension.
+    let gmst = norm(280.46061837 + 360.98564736629 * d);
+    let lst = rad(norm(gmst + SUN_LON));
+    let ha = lst - ra;
+
+    // Equatorial → horizontal: altitude only.
+    let lat = rad(SUN_LAT);
+    (lat.sin() * dec.sin() + lat.cos() * dec.cos() * ha.cos())
+        .asin()
+        .to_degrees()
 }
 
 /// Linear-interpolate tide height at an arbitrary time between the nearest bracketing NOAA samples. Clamps to endpoints if `t` is outside the range.
