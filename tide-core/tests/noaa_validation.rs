@@ -1,5 +1,4 @@
-//! Validate the harmonic synthesizer against a full year of NOAA published
-//! predictions for Bremerton (station 9445958, MSL datum, hourly, GMT).
+//! Validate the harmonic synthesizer against a full year of NOAA published predictions for Bremerton (station 9445958, MSL datum, hourly, GMT).
 //!
 //! Fixture: `tests/noaa_9445958_2026.csv` — `unix_secs,height_ft` per line.
 

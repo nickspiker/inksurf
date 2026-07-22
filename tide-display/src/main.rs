@@ -532,22 +532,15 @@ fn fetch_predictions(now: DateTime<Utc>) -> Result<Vec<Sample>> {
     Ok(samples)
 }
 
-/// MLLW = MSL + this offset (ft) at Bremerton (empirically 6.814 vs NOAA; MSL
-/// 18.20 − MLLW 11.38 = 6.82 on the station datum). tide-core predicts on MSL;
-/// the display's fixed axis is MLLW, so we shift.
+/// MLLW = MSL + this offset (ft) at Bremerton (empirically 6.814 vs NOAA; MSL 18.20 − MLLW 11.38 = 6.82 on the station datum). tide-core predicts on MSL; the display's fixed axis is MLLW, so we shift.
 const MSL_TO_MLLW_FT: f32 = 6.814;
 
-/// True when the daemon should compute tides on-device (tide-core harmonic
-/// synthesis) instead of fetching them from the NOAA API. Set INKSURF_ONDEVICE.
-/// This is the same math the nRF52840 firmware will run; use it to A/B the
-/// rendered frame against the network path and to run with no network at all.
+/// True when the daemon should compute tides on-device (tide-core harmonic synthesis) instead of fetching them from the NOAA API. Set INKSURF_ONDEVICE. This is the same math the nRF52840 firmware will run; use it to A/B the rendered frame against the network path and to run with no network at all.
 fn ondevice_mode() -> bool {
     std::env::var_os("INKSURF_ONDEVICE").is_some()
 }
 
-/// Generate the same ±12h / 6-min sample window as [`fetch_predictions`], but
-/// from tide-core's harmonic synthesizer — no network. Heights are converted
-/// from MSL (tide-core) to MLLW (display axis).
+/// Generate the same ±12h / 6-min sample window as [`fetch_predictions`], but from tide-core's harmonic synthesizer — no network. Heights are converted from MSL (tide-core) to MLLW (display axis).
 fn predict_samples(now: DateTime<Utc>) -> Vec<Sample> {
     let mut samples = Vec::with_capacity(241);
     for i in 0..=240 {

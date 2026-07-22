@@ -1,10 +1,6 @@
 //! P0 flash-loop validation: blink the XIAO nRF52840 user LED (bare metal).
 //!
-//! No embassy yet — this exists only to prove the toolchain end to end:
-//! thumbv7em build → UF2 conversion → double-tap-reset flash → the app actually
-//! boots at the memory.x origin and runs. Once the red LED blinks, the flash
-//! path and memory layout are confirmed and the panel driver (embassy + JD79667)
-//! can follow with confidence.
+//! No embassy yet — this exists only to prove the toolchain end to end: thumbv7em build → UF2 conversion → double-tap-reset flash → the app actually boots at the memory.x origin and runs. Once the red LED blinks, the flash path and memory layout are confirmed and the panel driver (embassy + JD79667) can follow with confidence.
 
 #![no_std]
 #![no_main]

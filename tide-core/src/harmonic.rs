@@ -1,9 +1,6 @@
 //! Harmonic tide synthesis from NOAA constituents + Schureman node factors.
 //!
-//! `height(t) = Z0 + Σ Hᵢ·fᵢ(t)·cos(Vᵢ(t) + uᵢ(t) − κᵢ)`, with the equilibrium
-//! argument `V` assembled from Doodson coefficients dotted with the astronomical
-//! arguments (see [`astro`]), the node factor `f` and correction `u` per
-//! Schureman, and `H`/`κ` the NOAA published amplitude/phase for the station.
+//! `height(t) = Z0 + Σ Hᵢ·fᵢ(t)·cos(Vᵢ(t) + uᵢ(t) − κᵢ)`, with the equilibrium argument `V` assembled from Doodson coefficients dotted with the astronomical arguments (see [`astro`]), the node factor `f` and correction `u` per Schureman, and `H`/`κ` the NOAA published amplitude/phase for the station.
 //!
 //! Z0 = 0 because the constituents are stated on the station's MSL datum.
 
@@ -13,9 +10,7 @@ use libm::{atan, cos, pow, sin, sqrt, tan};
 const D2R: f64 = core::f64::consts::PI / 180.0;
 const R2D: f64 = 180.0 / core::f64::consts::PI;
 
-/// `f64::powi` is std-only; provide an integer power for no_std via
-/// exponentiation-by-squaring. (In `test` builds the inherent std method wins;
-/// both compute the same value.)
+/// `f64::powi` is std-only; provide an integer power for no_std via exponentiation-by-squaring. (In `test` builds the inherent std method wins; both compute the same value.)
 trait Powi {
     fn powi(self, n: i32) -> Self;
 }
@@ -71,9 +66,7 @@ pub enum U {
     Modd3,
 }
 
-/// One harmonic constituent: Doodson coefficients, node-factor/correction
-/// composition (products of `F`, sums of `U`), and this station's H (ft) and
-/// κ (degrees, GMT).
+/// One harmonic constituent: Doodson coefficients, node-factor/correction composition (products of `F`, sums of `U`), and this station's H (ft) and κ (degrees, GMT).
 pub struct C {
     pub name: &'static str,
     pub coeffs: [i8; 7],
@@ -163,19 +156,14 @@ fn u_value(kind: U, a: &Astro) -> f64 {
     }
 }
 
-/// One harmonic term evaluated at an instant: `(amplitude, phase_deg)` where
-/// amplitude = Hᵢ·fᵢ (feet) and phase = Vᵢ+uᵢ−κᵢ (degrees). The height
-/// contribution is `amplitude · cos(phase_deg · π/180)`.
+/// One harmonic term evaluated at an instant: `(amplitude, phase_deg)` where amplitude = Hᵢ·fᵢ (feet) and phase = Vᵢ+uᵢ−κᵢ (degrees). The height contribution is `amplitude · cos(phase_deg · π/180)`.
 #[derive(Clone, Copy, Default)]
 pub struct Term {
     pub amplitude: f64,
     pub phase_deg: f64,
 }
 
-/// Decompose the prediction at `unix_secs` into per-constituent terms, filling
-/// `out` and returning the count written. The astronomy (V, u, f) is done in
-/// f64 here; the caller does the final `Σ amplitude·cos(phase)` accumulation —
-/// which is where a device can tune numeric precision to the clock margin.
+/// Decompose the prediction at `unix_secs` into per-constituent terms, filling `out` and returning the count written. The astronomy (V, u, f) is done in f64 here; the caller does the final `Σ amplitude·cos(phase)` accumulation — which is where a device can tune numeric precision to the clock margin.
 pub fn terms(constituents: &[C], unix_secs: f64, out: &mut [Term]) -> usize {
     let a = astro(unix_secs);
     let av = [a.t_plus_h_minus_s, a.s, a.h, a.p, a.n, a.pp, a.ninety];

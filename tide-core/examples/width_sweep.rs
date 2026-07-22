@@ -1,14 +1,8 @@
 //! Spirix width sweep through the *real* harmonic core.
 //!
-//! The earlier proof (`spirix/examples/tide_predict.rs`) fed raw ωt (billions of
-//! radians) into cos() to stress argument reduction. The real model computes the
-//! equilibrium argument V from mean longitudes already mod-360, so every cos()
-//! argument is a small angle — the reduction stress is gone. What remains is the
-//! 37-term accumulation `Σ Hᵢ·fᵢ·cos(Vᵢ+uᵢ−κᵢ)`.
+//! The earlier proof (`spirix/examples/tide_predict.rs`) fed raw ωt (billions of radians) into cos() to stress argument reduction. The real model computes the equilibrium argument V from mean longitudes already mod-360, so every cos() argument is a small angle — the reduction stress is gone. What remains is the 37-term accumulation `Σ Hᵢ·fᵢ·cos(Vᵢ+uᵢ−κᵢ)`.
 //!
-//! This sums the real per-constituent terms (astronomy done in f64 by tide-core)
-//! at several Spirix widths, comparing each against the f64 reference AND against
-//! a year of NOAA ground truth. Confirms F5E3 (32-bit fraction) is sufficient.
+//! This sums the real per-constituent terms (astronomy done in f64 by tide-core) at several Spirix widths, comparing each against the f64 reference AND against a year of NOAA ground truth. Confirms F5E3 (32-bit fraction) is sufficient.
 //!
 //! Run: cargo run --release --example width_sweep --target x86_64-unknown-linux-gnu
 
@@ -17,8 +11,7 @@ use tide_core::{terms, Term, BREMERTON};
 
 const D2R: f64 = std::f64::consts::PI / 180.0;
 
-/// Sum the real terms at a chosen Spirix width. cos() runs in the Scalar type,
-/// so this is exactly the precision-sensitive accumulation a device would do.
+/// Sum the real terms at a chosen Spirix width. cos() runs in the Scalar type, so this is exactly the precision-sensitive accumulation a device would do.
 macro_rules! sum_at {
     ($S:ty, $terms:expr) => {{
         type S = $S;

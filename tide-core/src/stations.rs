@@ -1,7 +1,6 @@
 //! Baked harmonic constituents per station.
 //!
-//! AUTO-GENERATED from NOAA `harcon.json`. The (H, κ) pairs are station-specific;
-//! the Doodson coefficients and node-factor composition are universal.
+//! AUTO-GENERATED from NOAA `harcon.json`. The (H, κ) pairs are station-specific; the Doodson coefficients and node-factor composition are universal.
 
 use crate::harmonic::{C, F, U};
 

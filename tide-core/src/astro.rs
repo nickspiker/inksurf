@@ -1,13 +1,8 @@
 //! Astronomical arguments for tidal harmonic prediction.
 //!
-//! Port of pytides' `astro.py` (which follows Meeus for the mean longitudes and
-//! Schureman for the nodal auxiliaries). All angles are in degrees. Input is an
-//! absolute UTC instant as a Unix timestamp — no timezone or DST enters here.
+//! Port of pytides' `astro.py` (which follows Meeus for the mean longitudes and Schureman for the nodal auxiliaries). All angles are in degrees. Input is an absolute UTC instant as a Unix timestamp — no timezone or DST enters here.
 //!
-//! The mean-longitude polynomials are in `T` = Julian centuries since J2000.
-//! We evaluate everything at the actual prediction time, so a constituent's
-//! equilibrium argument `V(t)` already carries its full time evolution (it is
-//! linear in these mean longitudes, which advance at the constituent's speed).
+//! The mean-longitude polynomials are in `T` = Julian centuries since J2000. We evaluate everything at the actual prediction time, so a constituent's equilibrium argument `V(t)` already carries its full time evolution (it is linear in these mean longitudes, which advance at the constituent's speed).
 
 use libm::{atan, cos, floor, sin, tan};
 
@@ -54,8 +49,7 @@ const OBLIQUITY: [f64; 4] = [23.439_291_111, -0.013_004_167, -0.000_000_164, 0.0
 // Lunar orbital inclination to the ecliptic (degrees), essentially constant.
 const LUNAR_INCLINATION: f64 = 5.145;
 
-/// The astronomical arguments needed to assemble equilibrium arguments and node
-/// factors, all in degrees, evaluated at one instant.
+/// The astronomical arguments needed to assemble equilibrium arguments and node factors, all in degrees, evaluated at one instant.
 #[derive(Clone, Copy)]
 pub struct Astro {
     pub t_plus_h_minus_s: f64, // T+h−s (hour angle of mean sun + h − s)
