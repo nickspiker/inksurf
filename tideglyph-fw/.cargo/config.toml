@@ -1,0 +1,10 @@
+# nRF52840 = Cortex-M4F. Overrides the repo-root config (which targets the
+# RP2040's thumbv6m) for builds run inside this crate.
+[target.thumbv7em-none-eabihf]
+rustflags = [
+    "-C", "link-arg=--nmagic",
+    "-C", "link-arg=-Tlink.x",
+]
+
+[build]
+target = "thumbv7em-none-eabihf"

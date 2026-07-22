@@ -15,3 +15,4 @@ firmware/
 
 # Stale hero asset; README now points to assets/hero.webp
 docs/
+tideglyph-fw/target/

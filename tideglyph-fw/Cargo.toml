@@ -1,0 +1,18 @@
+[package]
+name = "tideglyph-fw"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "nRF52840 firmware for the cordless BWRY tide clock (Seeed XIAO + 2.9in JD79667 panel)"
+
+[dependencies]
+cortex-m = { version = "0.7", features = ["inline-asm"] }
+cortex-m-rt = "0.7"
+panic-halt = "0.2"
+
+[profile.release]
+opt-level = "z"
+lto = "fat"
+codegen-units = 1
+overflow-checks = false
+debug = true
