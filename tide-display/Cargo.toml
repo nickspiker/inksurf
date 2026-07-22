@@ -19,3 +19,4 @@ serialport  = "4"
 png         = "0.17"
 sunrise     = "1"
 fastrand    = "2"
+tide-core   = { path = "../tide-core" }

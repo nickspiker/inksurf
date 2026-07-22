@@ -375,7 +375,11 @@ fn tick(last_cleaned: &mut Option<DateTime<Utc>>, render_time: DateTime<Utc>) ->
         }
     }
 
-    let preds = fetch_predictions(render_time)?;
+    let preds = if ondevice_mode() {
+        predict_samples(render_time)
+    } else {
+        fetch_predictions(render_time)?
+    };
     let canvas = render(&preds, render_time)?;
     let fb = pack_to_chip(&canvas);
     send_to_panel(&fb)?;
@@ -526,6 +530,37 @@ fn fetch_predictions(now: DateTime<Utc>) -> Result<Vec<Sample>> {
         samples.iter().map(|s| s.height_ft).fold(f32::NEG_INFINITY, f32::max),
     );
     Ok(samples)
+}
+
+/// MLLW = MSL + this offset (ft) at Bremerton (empirically 6.814 vs NOAA; MSL
+/// 18.20 − MLLW 11.38 = 6.82 on the station datum). tide-core predicts on MSL;
+/// the display's fixed axis is MLLW, so we shift.
+const MSL_TO_MLLW_FT: f32 = 6.814;
+
+/// True when the daemon should compute tides on-device (tide-core harmonic
+/// synthesis) instead of fetching them from the NOAA API. Set INKSURF_ONDEVICE.
+/// This is the same math the nRF52840 firmware will run; use it to A/B the
+/// rendered frame against the network path and to run with no network at all.
+fn ondevice_mode() -> bool {
+    std::env::var_os("INKSURF_ONDEVICE").is_some()
+}
+
+/// Generate the same ±12h / 6-min sample window as [`fetch_predictions`], but
+/// from tide-core's harmonic synthesizer — no network. Heights are converted
+/// from MSL (tide-core) to MLLW (display axis).
+fn predict_samples(now: DateTime<Utc>) -> Vec<Sample> {
+    let mut samples = Vec::with_capacity(241);
+    for i in 0..=240 {
+        let when = now - Duration::hours(12) + Duration::minutes(6 * i);
+        let msl = tide_core::predict(tide_core::BREMERTON, when.timestamp() as f64) as f32;
+        samples.push(Sample { when, height_ft: msl + MSL_TO_MLLW_FT });
+    }
+    eprintln!("  predicted {} samples on-device (height range {:.2}..{:.2} ft)",
+        samples.len(),
+        samples.iter().map(|s| s.height_ft).fold(f32::INFINITY, f32::min),
+        samples.iter().map(|s| s.height_ft).fold(f32::NEG_INFINITY, f32::max),
+    );
+    samples
 }
 
 // ============================================================================
