@@ -163,20 +163,27 @@ fn u_value(kind: U, a: &Astro) -> f64 {
     }
 }
 
-/// Predicted tide height (feet, on the station's MSL datum) at a Unix timestamp.
-pub fn predict(constituents: &[C], unix_secs: f64) -> f64 {
+/// One harmonic term evaluated at an instant: `(amplitude, phase_deg)` where
+/// amplitude = Hᵢ·fᵢ (feet) and phase = Vᵢ+uᵢ−κᵢ (degrees). The height
+/// contribution is `amplitude · cos(phase_deg · π/180)`.
+#[derive(Clone, Copy, Default)]
+pub struct Term {
+    pub amplitude: f64,
+    pub phase_deg: f64,
+}
+
+/// Decompose the prediction at `unix_secs` into per-constituent terms, filling
+/// `out` and returning the count written. The astronomy (V, u, f) is done in
+/// f64 here; the caller does the final `Σ amplitude·cos(phase)` accumulation —
+/// which is where a device can tune numeric precision to the clock margin.
+pub fn terms(constituents: &[C], unix_secs: f64, out: &mut [Term]) -> usize {
     let a = astro(unix_secs);
-    let av = [
-        a.t_plus_h_minus_s,
-        a.s,
-        a.h,
-        a.p,
-        a.n,
-        a.pp,
-        a.ninety,
-    ];
-    let mut height = 0.0;
+    let av = [a.t_plus_h_minus_s, a.s, a.h, a.p, a.n, a.pp, a.ninety];
+    let mut count = 0;
     for c in constituents {
+        if count >= out.len() {
+            break;
+        }
         // Equilibrium argument V = Doodson coefficients · astronomical args.
         let mut v = 0.0;
         for k in 0..7 {
@@ -192,7 +199,22 @@ pub fn predict(constituents: &[C], unix_secs: f64) -> f64 {
         for &(kind, mult) in c.u {
             u += u_value(kind, &a) * mult as f64;
         }
-        height += c.h * f * cos((v + u - c.kappa) * D2R);
+        out[count] = Term {
+            amplitude: c.h * f,
+            phase_deg: v + u - c.kappa,
+        };
+        count += 1;
+    }
+    count
+}
+
+/// Predicted tide height (feet, on the station's MSL datum) at a Unix timestamp.
+pub fn predict(constituents: &[C], unix_secs: f64) -> f64 {
+    let mut buf = [Term::default(); 64];
+    let n = terms(constituents, unix_secs, &mut buf);
+    let mut height = 0.0;
+    for t in &buf[..n] {
+        height += t.amplitude * cos(t.phase_deg * D2R);
     }
     height
 }

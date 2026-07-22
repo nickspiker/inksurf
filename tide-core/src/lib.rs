@@ -11,5 +11,5 @@ pub mod astro;
 pub mod harmonic;
 pub mod stations;
 
-pub use harmonic::predict;
+pub use harmonic::{predict, terms, Term};
 pub use stations::BREMERTON;
