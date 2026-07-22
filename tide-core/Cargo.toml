@@ -1,0 +1,17 @@
+[package]
+name = "tide-core"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "no_std harmonic tide prediction + rendering core, shared by the Pi daemon and the nRF52840 firmware"
+
+[dependencies]
+# Portable float math so the harmonic synthesis runs identically on host and on
+# thumbv7em (no std). libm builds everywhere.
+libm = "0.2"
+
+[features]
+default = []
+
+[dev-dependencies]
+# Validation tests run on the host and use std (the test harness is std anyway).
