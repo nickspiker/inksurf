@@ -60,12 +60,19 @@ fn main() -> ! {
     let port0 = p0::Parts::new(p.P0);
     let port1 = p1::Parts::new(p.P1);
 
-    // Diagnostic LED (red, P0.26, active-low): solid ON while the panel sequence
-    // runs; a slow heartbeat once it completes. Solid-and-never-heartbeats means
-    // stuck (a BUSY wait maxed out or a panic); heartbeat means every SPI write
-    // + refresh finished. This is our signal independent of the panel itself.
-    let mut led = port0.p0_26.into_push_pull_output(Level::High).degrade();
-    let _ = led.set_low(); // ON
+    // Diagnostic LEDs on the RGB (active-low), chosen to be unmistakable vs the
+    // board's hardware orange charge LED: BLUE = "my code is running", GREEN =
+    // "panel sequence completed". Boot proof: 3 deliberate blue pulses up front —
+    // if you see those, the app is definitely executing (not the charge LED).
+    let mut blue = port0.p0_06.into_push_pull_output(Level::High).degrade();
+    let mut green = port0.p0_30.into_push_pull_output(Level::High).degrade();
+    for _ in 0..3 {
+        let _ = blue.set_low();
+        delay_ms(300);
+        let _ = blue.set_high();
+        delay_ms(300);
+    }
+    let _ = blue.set_low(); // BLUE stays on through the panel sequence
 
     // SPI pins: SCLK=P1.13 (D8), MOSI=P1.15 (D10). Panel is write-only (no MISO).
     let sck = port1.p1_13.into_push_pull_output(Level::Low).degrade();
@@ -156,12 +163,13 @@ fn main() -> ! {
 
     cmd(&mut spi, &mut cs, &mut dc, 0x02, &[]); // POWER OFF
 
-    // Completed the full sequence — heartbeat the LED so we can tell "ran to the
-    // end" apart from "stuck mid-init".
+    // Completed the full sequence: blue off, green heartbeat. Blue-stuck-on (no
+    // green) means it hung mid-init; green blinking means everything finished.
+    let _ = blue.set_high();
     loop {
-        let _ = led.set_low();
+        let _ = green.set_low();
         delay_ms(150);
-        let _ = led.set_high();
+        let _ = green.set_high();
         delay_ms(850);
     }
 }
