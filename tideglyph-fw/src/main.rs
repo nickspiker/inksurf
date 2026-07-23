@@ -15,6 +15,33 @@ use panic_halt as _;
 use hal::gpio::{p0, p1, Level};
 use hal::spim::{Frequency, Pins, Spim, MODE_0};
 
+// Diagnostic LED on D0 = P0.02, driven by DIRECT registers (independent of the
+// HAL, so it reports even if the HAL is what faults). Active high: drive high =
+// LED on. Wire an LED + ~470Ω from D0 to GND.
+const P0_BASE: u32 = 0x5000_0000;
+const P0_DIRSET: u32 = P0_BASE + 0x518;
+const P0_OUTSET: u32 = P0_BASE + 0x508;
+const P0_OUTCLR: u32 = P0_BASE + 0x50C;
+const LED_PIN: u32 = 2; // P0.02 = D0
+
+#[inline(always)]
+fn led_init() {
+    unsafe { core::ptr::write_volatile(P0_DIRSET as *mut u32, 1 << LED_PIN) }
+}
+#[inline(always)]
+fn led(on: bool) {
+    let reg = if on { P0_OUTSET } else { P0_OUTCLR };
+    unsafe { core::ptr::write_volatile(reg as *mut u32, 1 << LED_PIN) }
+}
+fn led_blink(times: u32) {
+    for _ in 0..times {
+        led(true);
+        delay_ms(120);
+        led(false);
+        delay_ms(120);
+    }
+}
+
 // SSD1681 mono: 200×200, 1 bit/pixel, 8 px/byte.
 const W: usize = 200;
 const H: usize = 200;
@@ -41,6 +68,12 @@ static mut FB: [u8; FB_BYTES] = [0; FB_BYTES];
 
 #[entry]
 fn main() -> ! {
+    // Stage 1: app booted (direct registers, before any HAL). If you never see
+    // even 1 blink, the app isn't running / LED is miswired.
+    led_init();
+    led_blink(1);
+    delay_ms(800);
+
     let p = hal::pac::Peripherals::take().unwrap();
     let port0 = p0::Parts::new(p.P0);
     let port1 = p1::Parts::new(p.P1);
@@ -55,6 +88,10 @@ fn main() -> ! {
         MODE_0,
         0,
     );
+
+    // Stage 2: peripherals + Spim::new survived (the HAL SPI init is a fault suspect).
+    led_blink(2);
+    delay_ms(800);
 
     // Control pins on the EN04/EN05 board: CS=D7=P1.12, DC=D16=P0.31, RST=D11=P0.15, BUSY=D3=P0.29, panel power-enable EN=D6=P1.11 (driven HIGH).
     let mut panel_en = port1.p1_11.into_push_pull_output(Level::Low).degrade();
@@ -97,12 +134,17 @@ fn main() -> ! {
     cmd(&mut spi, &mut cs, &mut dc, 0x4F, &[0x00, 0x00]); // RAM Y address counter
     wait_ready(&mut busy);
 
-    // DIAGNOSTIC: flip the whole panel black ↔ white forever. If the panel is
-    // driven correctly you'll SEE it alternate; if it stays solid white, the
-    // refresh isn't reaching it. This is unambiguous vs a panel that ships white.
+    // Stage 3: panel reset + full init sequence completed (all those SPI writes went out and the post-power-on BUSY wait returned).
+    led_blink(3);
+    delay_ms(800);
+
+    // DIAGNOSTIC: flip the whole panel black ↔ white forever, with a single LED blip per cycle. LED blipping steadily = the loop (SPI sequence) runs every iteration; LED stuck after 3 = faulted in init; stuck after 2 = faulted at Spim::new.
     let fb = unsafe { &mut *core::ptr::addr_of_mut!(FB) };
     let mut fill: u8 = 0x00;
     loop {
+        led(true);
+        delay_ms(150);
+        led(false);
         for b in fb.iter_mut() {
             *b = fill;
         }
