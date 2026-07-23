@@ -15,17 +15,6 @@ use panic_halt as _;
 use hal::gpio::{p0, p1, Level};
 use hal::spim::{Frequency, Pins, Spim, MODE_0};
 
-// Runs before .data/.bss init. The board boots our app THROUGH the S140
-// SoftDevice, which can leave its interrupts enabled and VTOR pointing at its
-// own table (0x1000). If one fires during our startup it vectors into an
-// uninitialised SoftDevice and faults before main. Disable interrupts and point
-// VTOR at our own vector table (FLASH ORIGIN 0x27000) as the very first thing.
-#[cortex_m_rt::pre_init]
-unsafe fn pre_init() {
-    core::arch::asm!("cpsid i");
-    const VTOR: *mut u32 = 0xE000_ED08 as *mut u32;
-    core::ptr::write_volatile(VTOR, 0x0002_7000);
-}
 
 // Diagnostic LED on D9 = P1.14 (the SPI MISO line — unused by a write-only
 // e-paper panel, so a safe sacrificial pin). Driven by DIRECT registers

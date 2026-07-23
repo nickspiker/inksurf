@@ -8,7 +8,7 @@ set -euo pipefail
 
 CRATE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ELF="$CRATE/target/thumbv7em-none-eabihf/release/tideglyph-fw"
-BASE_ADDR="${BASE_ADDR:-0x27000}"         # must match memory.x FLASH ORIGIN (after the S140 SoftDevice)
+BASE_ADDR="${BASE_ADDR:-0x1000}"          # must match memory.x FLASH ORIGIN (bare, no SoftDevice)
 FAMILY="0xADA52840"                        # nRF52840 UF2 family id
 
 # cd into the crate so cargo discovers tideglyph-fw/.cargo/config.toml (target +

@@ -13,11 +13,11 @@
  */
 MEMORY
 {
-    FLASH : ORIGIN = 0x00027000, LENGTH = 0xCD000
-    /* RAM starts at 0x20003000, not 0x20000000: the S140 SoftDevice (present
-       from the bootloader) reserves the low RAM. Our app's .data/.bss/stack
-       must sit above it or they collide with the SoftDevice and fault the app
-       as soon as it touches the framebuffer. 0x3000 = 12 KB is ample for a
-       non-enabled S140. */
-    RAM   : ORIGIN = 0x20003000, LENGTH = 0x3D000
+    /* Run BARE (no SoftDevice). The app is flashed at 0x1000, right after the
+       MBR, overwriting the S140 SoftDevice — the bootloader detects "no SD" and
+       boots us directly, so nothing forwards through the SoftDevice and faults
+       us. Bootloader (0xF4000) and MBR (0x0) are untouched; double-tap reset
+       still recovers to UF2 DFU. Full RAM is ours. */
+    FLASH : ORIGIN = 0x00001000, LENGTH = 0xF3000
+    RAM   : ORIGIN = 0x20000000, LENGTH = 256K
 }
