@@ -1,14 +1,8 @@
-//! P0 panel bring-up: drive the Seeed 2.9" BWRY (JD79667, 128×296) panel and
-//! push a 4-color-band test frame (black / white / yellow / red).
+//! P0 panel bring-up: drive the **Adafruit 6414** BWRY panel (JD79667, 384×180 landscape; 180×384 in chip coords) via the Seeed nRF52840 + EN04 board, and push a 4-band test frame (black / white / yellow / red).
 //!
-//! This is the panel equivalent of the blink: it validates the SPI wiring, the
-//! JD79667 init sequence, the DTM framebuffer stream, and the refresh — and the
-//! bands confirm the 2-bit colour mapping in one shot before we render tides.
+//! The panel currently wired to the board is the Adafruit 6414 (the one that already shows the old tide chart), not the Seeed 2.9". Its driver is inksurf's proven src/panel_jd79667.rs: identical JD79667 init EXCEPT TRES geometry (180×384 → [0x00,0xB4,0x01,0x80]), DTM=0x10, DRF=0x12+[0x00], BUSY low=busy. Pins remain the Seeed EN04 board's nRF GPIO (panel connects through it).
 //!
-//! Driver facts reused from inksurf's working JD79667 panel (src/panel_jd79667.rs):
-//! DTM=0x10, DRF=0x12+[0x00], POWER_ON=0x04, POWER_OFF=0x02, and BUSY is LOW
-//! while the chip is busy (wait for it to go HIGH). Init sequence + TRES geometry
-//! from Seeed's Setup512 for this specific 128×296 BWRY panel.
+//! Caveat: the Adafruit ribbon's pin assignments may not match the Seeed FPC connector; if this shows nothing, that mismatch is the likely hardware cause.
 
 #![no_std]
 #![no_main]
@@ -23,10 +17,12 @@ use panic_halt as _;
 use hal::gpio::{p0, p1, Level};
 use hal::spim::{Frequency, Pins, Spim, MODE_0};
 
-const W: usize = 128;
-const H: usize = 296;
-const ROW_BYTES: usize = W / 4; // 2 bits/px, 4 px/byte = 32
-const FB_BYTES: usize = ROW_BYTES * H; // 9472
+// Adafruit 6414 in chip coordinates: 180 wide × 384 tall, 2 bits/px.
+const W: usize = 180;
+const H: usize = 384;
+const ROW_BYTES: usize = W / 4; // 45
+// inksurf's firmware streams 17,664 B (45×384 = 17,280 data + trailing padding).
+const FB_BYTES: usize = 17_664;
 
 // JD79667 2-bit colour codes (from inksurf's working panel), packed 4/byte.
 const BLACK: u8 = 0b00;
@@ -124,7 +120,7 @@ fn main() -> ! {
     cmd(&mut spi, &mut cs, &mut dc, 0x06, &[0x05, 0x00, 0x3F, 0x0A, 0x25, 0x12, 0x1A]); // BTST
     cmd(&mut spi, &mut cs, &mut dc, 0x50, &[0x37]); // CDI
     cmd(&mut spi, &mut cs, &mut dc, 0x60, &[0x02, 0x02]); // TCON
-    cmd(&mut spi, &mut cs, &mut dc, 0x61, &[0x00, 0x80, 0x01, 0x28]); // TRES 128×296
+    cmd(&mut spi, &mut cs, &mut dc, 0x61, &[0x00, 0xB4, 0x01, 0x80]); // TRES 180×384 (Adafruit 6414)
     cmd(&mut spi, &mut cs, &mut dc, 0xE7, &[0x1C]);
     cmd(&mut spi, &mut cs, &mut dc, 0xE3, &[0x22]);
     cmd(&mut spi, &mut cs, &mut dc, 0xB4, &[0xD0]);
@@ -149,11 +145,11 @@ fn main() -> ! {
         }
     }
 
-    // Stream the framebuffer, then refresh (DRF = 0x12 + [0x00]). Seeed's driver
-    // for THIS 2.9" panel writes pixel data via RAMWR = 0x13 (not inksurf's 0x10).
+    // Stream the framebuffer via DTM = 0x10 (Adafruit 6414 / inksurf), then
+    // refresh (DRF = 0x12 + [0x00]).
     let _ = OutputPin::set_low(&mut dc);
     let _ = OutputPin::set_low(&mut cs);
-    let _ = SpiBus::write(&mut spi, &[0x13]);
+    let _ = SpiBus::write(&mut spi, &[0x10]);
     let _ = OutputPin::set_high(&mut dc);
     let _ = SpiBus::write(&mut spi, &fb[..]);
     let _ = OutputPin::set_high(&mut cs);
