@@ -164,17 +164,6 @@ fn main() -> ! {
         }
         let _ = OutputPin::set_high(&mut cs);
 
-        cmd(&mut spi, &mut cs, &mut dc, 0x4E, &[0x00]);
-        cmd(&mut spi, &mut cs, &mut dc, 0x4F, &[0x00, 0x00]);
-        let _ = OutputPin::set_low(&mut dc);
-        let _ = OutputPin::set_low(&mut cs);
-        let _ = SpiBus::write(&mut spi, &[0x26]);
-        let _ = OutputPin::set_high(&mut dc);
-        for _ in 0..(FB_BYTES / 64) {
-            let _ = SpiBus::write(&mut spi, &[0u8; 64]);
-        }
-        let _ = OutputPin::set_high(&mut cs);
-
         // Full refresh (0x22[0xF7] + 0x20).
         cmd(&mut spi, &mut cs, &mut dc, 0x22, &[0xF7]);
         cmd(&mut spi, &mut cs, &mut dc, 0x20, &[]);
