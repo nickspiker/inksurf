@@ -1,0 +1,8 @@
+# Bootloader is soft-float (no FPU use) — mirrors embassy's nrf bootloader example
+# and keeps the boot->app FPU handoff trivial. Overrides the repo-root config
+# (RP2040 thumbv6m) for builds run inside this crate.
+[build]
+target = "thumbv7em-none-eabi"
+
+[target.'cfg(all(target_arch = "arm", target_os = "none"))']
+runner = "probe-rs run --chip nRF52840_xxAA"
