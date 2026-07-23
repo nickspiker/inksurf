@@ -35,6 +35,11 @@ blake3 = { version = "1", default-features = false }
 embassy-boot = { version = "0.7", default-features = false, features = ["defmt"] }
 embassy-embedded-hal = { version = "0.6", default-features = false }
 
+# Trust: VSF signature verification on-device. crypto-verify = Ed25519 verify
+# (no RNG) + BLAKE3, no_std. Needs an allocator (vsf uses alloc).
+vsf = { path = "../../vsf", default-features = false, features = ["crypto-verify"] }
+embedded-alloc = "0.6"
+
 [patch.crates-io]
 nrf-sdc = { git = "https://github.com/alexmoon/nrf-sdc.git", rev = "abe49d22ebfc85fae134eb082fbfddf752016a55" }
 nrf-mpsl = { git = "https://github.com/alexmoon/nrf-sdc.git", rev = "abe49d22ebfc85fae134eb082fbfddf752016a55" }

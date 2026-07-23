@@ -6,10 +6,10 @@
    signed manifest page). */
 MEMORY
 {
-  FLASH            : ORIGIN = 0x00008000, LENGTH = 256K  /* = ACTIVE (running app) */
+  FLASH            : ORIGIN = 0x00008000, LENGTH = 384K  /* = ACTIVE (running app) */
   BOOTLOADER_STATE : ORIGIN = 0x00007000, LENGTH = 4K
-  DFU              : ORIGIN = 0x00048000, LENGTH = 260K
-  MANIFEST         : ORIGIN = 0x00089000, LENGTH = 4K
+  DFU              : ORIGIN = 0x00068000, LENGTH = 388K
+  MANIFEST         : ORIGIN = 0x000C9000, LENGTH = 4K
   RAM        (rwx) : ORIGIN = 0x20000000, LENGTH = 256K
 }
 

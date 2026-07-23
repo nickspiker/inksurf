@@ -33,6 +33,29 @@ use {defmt_rtt as _, panic_probe as _};
 const CONNECTIONS_MAX: usize = 1;
 const L2CAP_CHANNELS_MAX: usize = 2; // signal + att
 
+// Global allocator — vsf's verify path uses alloc (Vec/String while parsing the
+// signed manifest). 16 KB is ample for a few-hundred-byte manifest doc.
+#[global_allocator]
+static HEAP: embedded_alloc::LlffHeap = embedded_alloc::LlffHeap::empty();
+const HEAP_SIZE: usize = 16 * 1024;
+static mut HEAP_MEM: [u8; HEAP_SIZE] = [0; HEAP_SIZE];
+
+/// Ed25519 public key the OTA release manifest must be signed by. Placeholder
+/// zeros until the real release key is generated host-side (tideglyph-push).
+#[allow(dead_code)] // wired into COMMIT in the OTA-protocol step
+const RELEASE_PUBKEY: [u8; 32] = [0u8; 32];
+
+/// Verify a signed VSF manifest is authentic + from our release signer. Returns
+/// the decoded header on success. This is the single trust gate — a bad
+/// provenance, signature, or signer is rejected here.
+#[allow(dead_code)] // wired into COMMIT in the OTA-protocol step
+fn verify_manifest(manifest: &[u8]) -> Result<vsf::file_format::VsfHeader, ()> {
+    match vsf::verification::read_verified(manifest, Some(RELEASE_PUBKEY)) {
+        Ok((header, _end)) => Ok(header),
+        Err(_) => Err(()),
+    }
+}
+
 // D9 = P1.14 diagnostic LED, direct registers (independent of any HAL state).
 const P1_BASE: u32 = 0x5000_0300;
 const DIRSET: u32 = P1_BASE + 0x518;
@@ -121,6 +144,8 @@ struct XferService {
 
 #[embassy_executor::main]
 async fn main(spawner: Spawner) {
+    unsafe { HEAP.init(core::ptr::addr_of_mut!(HEAP_MEM) as usize, HEAP_SIZE) }
+
     let p = embassy_nrf::init(Default::default());
     led_init();
 

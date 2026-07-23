@@ -9,8 +9,8 @@ MEMORY
 {
   FLASH            : ORIGIN = 0x00001000, LENGTH = 24K   /* bootloader code            */
   BOOTLOADER_STATE : ORIGIN = 0x00007000, LENGTH = 4K    /* swap magic + progress      */
-  ACTIVE           : ORIGIN = 0x00008000, LENGTH = 256K  /* running app                */
-  DFU              : ORIGIN = 0x00048000, LENGTH = 260K  /* staging = ACTIVE + 1 page  */
+  ACTIVE           : ORIGIN = 0x00008000, LENGTH = 384K  /* running app (crypto app ~346K) */
+  DFU              : ORIGIN = 0x00068000, LENGTH = 388K  /* staging = ACTIVE + 1 page  */
   RAM        (rwx) : ORIGIN = 0x20000000, LENGTH = 32K   /* bootloader-only; app gets all 256K */
 }
 
