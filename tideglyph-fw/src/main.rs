@@ -30,14 +30,12 @@ const WHITE: u8 = 0b01;
 const YELLOW: u8 = 0b10;
 const RED: u8 = 0b11;
 
-// ~64 MHz core → cycles per millisecond. Init delays only need a lower bound, so
-// exactness doesn't matter.
+// ~64 MHz core → cycles per millisecond. Init delays only need a lower bound, so exactness doesn't matter.
 fn delay_ms(ms: u32) {
     cpu_delay(64_000 * ms);
 }
 
-/// Wait for the chip to signal ready (BUSY goes HIGH), bounded so a mis-wired or
-/// floating BUSY line can't deadlock init with no feedback (~5 s cap).
+/// Wait for the chip to signal ready (BUSY goes HIGH), bounded so a mis-wired or floating BUSY line can't deadlock init with no feedback (~5 s cap).
 fn wait_ready<P: InputPin>(busy: &mut P) {
     for _ in 0..5000 {
         if busy.is_high().unwrap_or(true) {
@@ -56,10 +54,7 @@ fn main() -> ! {
     let port0 = p0::Parts::new(p.P0);
     let port1 = p1::Parts::new(p.P1);
 
-    // Diagnostic LEDs on the RGB (active-low), chosen to be unmistakable vs the
-    // board's hardware orange charge LED: BLUE = "my code is running", GREEN =
-    // "panel sequence completed". Boot proof: 3 deliberate blue pulses up front —
-    // if you see those, the app is definitely executing (not the charge LED).
+    // Diagnostic LEDs on the RGB (active-low), chosen to be unmistakable vs the board's hardware orange charge LED: BLUE = "my code is running", GREEN = "panel sequence completed". Boot proof: 3 deliberate blue pulses up front — if you see those, the app is definitely executing (not the charge LED).
     let mut blue = port0.p0_06.into_push_pull_output(Level::High).degrade();
     let mut green = port0.p0_30.into_push_pull_output(Level::High).degrade();
     for _ in 0..3 {
@@ -81,9 +76,7 @@ fn main() -> ! {
         0,
     );
 
-    // Control pins on the EN04/EN05 board (D-label → nRF GPIO from the Plus
-    // variant): CS=D7=P1.12, DC=D16=P0.31, RST=D11=P0.15, BUSY=D3=P0.29,
-    // and the panel power-enable EN=D6=P1.11 (must be driven HIGH to power it).
+    // Control pins on the EN04/EN05 board (D-label → nRF GPIO from the Plus variant): CS=D7=P1.12, DC=D16=P0.31, RST=D11=P0.15, BUSY=D3=P0.29, and the panel power-enable EN=D6=P1.11 (must be driven HIGH to power it).
     let mut panel_en = port1.p1_11.into_push_pull_output(Level::Low).degrade();
     let mut cs = port1.p1_12.into_push_pull_output(Level::High).degrade();
     let mut dc = port0.p0_31.into_push_pull_output(Level::Low).degrade();
@@ -145,8 +138,7 @@ fn main() -> ! {
         }
     }
 
-    // Stream the framebuffer via DTM = 0x10 (Adafruit 6414 / inksurf), then
-    // refresh (DRF = 0x12 + [0x00]).
+    // Stream the framebuffer via DTM = 0x10 (Adafruit 6414 / inksurf), then refresh (DRF = 0x12 + [0x00]).
     let _ = OutputPin::set_low(&mut dc);
     let _ = OutputPin::set_low(&mut cs);
     let _ = SpiBus::write(&mut spi, &[0x10]);
@@ -155,14 +147,11 @@ fn main() -> ! {
     let _ = OutputPin::set_high(&mut cs);
 
     cmd(&mut spi, &mut cs, &mut dc, 0x12, &[0x00]); // DRF refresh
-    // Unconditional long wait — do NOT trust BUSY (if it's mis-wired it reads
-    // high and we'd power off mid-refresh, blanking the panel). A BWRY full
-    // refresh is several seconds; give it 25 s, then leave the panel powered.
+    // Unconditional long wait — do NOT trust BUSY (if it's mis-wired it reads high and we'd power off mid-refresh, blanking the panel). A BWRY full refresh is several seconds; give it 25 s, then leave the panel powered.
     delay_ms(25_000);
     // (No power-off — keep it simple; the image is latched by the refresh.)
 
-    // Completed the full sequence: blue off, green heartbeat. Blue-stuck-on (no
-    // green) means it hung mid-init; green blinking means everything finished.
+    // Completed the full sequence: blue off, green heartbeat. Blue-stuck-on (no green) means it hung mid-init; green blinking means everything finished.
     let _ = blue.set_high();
     loop {
         let _ = green.set_low();
