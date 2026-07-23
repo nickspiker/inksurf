@@ -140,35 +140,49 @@ fn main() -> ! {
     led_blink(3);
     delay_ms(800);
 
-    // DIAGNOSTIC: flip the whole panel black ↔ white forever, with a single LED blip per cycle. LED blipping steadily = the loop (SPI sequence) runs every iteration; LED stuck after 3 = faulted in init; stuck after 2 = faulted at Spim::new.
     let fb = unsafe { &mut *core::ptr::addr_of_mut!(FB) };
-    let mut fill: u8 = 0x00;
+
+    // Write the whole B/W RAM (0x24) from fb, then full-refresh. Reset the RAM
+    // address counter to (0,0) first.
+    let mut show = |spi: &mut Spim<hal::pac::SPIM0>, cs: &mut _, dc: &mut _, busy: &mut _, fb: &[u8]| {
+        cmd(spi, cs, dc, 0x4E, &[0x00]);
+        cmd(spi, cs, dc, 0x4F, &[0x00, 0x00]);
+        let _ = OutputPin::set_low(dc as &mut _);
+        let _ = OutputPin::set_low(cs as &mut _);
+        let _ = SpiBus::write(spi, &[0x24]);
+        let _ = OutputPin::set_high(dc as &mut _);
+        for chunk in fb.chunks(64) {
+            let _ = SpiBus::write(spi, chunk);
+        }
+        let _ = OutputPin::set_high(cs as &mut _);
+        cmd(spi, cs, dc, 0x22, &[0xF7]);
+        cmd(spi, cs, dc, 0x20, &[]);
+        delay_ms(2_000);
+        wait_ready(busy);
+    };
+
+    // First clear to solid white to establish a clean base (kill ghosting).
+    for b in fb.iter_mut() {
+        *b = 0xFF;
+    }
+    show(&mut spi, &mut cs, &mut dc, &mut busy, fb);
+
+    // Then a static 4-band pattern: 50-row bands black / white / black / white,
+    // top to bottom. This is a KNOWN reference — how it actually renders tells us
+    // the pixel format (bit order, row layout) precisely.
+    for row in 0..H {
+        let byte = if (row / 50) % 2 == 0 { 0x00 } else { 0xFF };
+        for c in 0..ROW_BYTES {
+            fb[row * ROW_BYTES + c] = byte;
+        }
+    }
+    show(&mut spi, &mut cs, &mut dc, &mut busy, fb);
+
+    // Done — just heartbeat the LED so we know it's alive; leave the image up.
     loop {
         led(true);
         delay_ms(150);
         led(false);
-        for b in fb.iter_mut() {
-            *b = fill;
-        }
-        // Write B/W RAM (0x24) with the fill, then RED RAM (0x26) blanked to
-        // zeros — inksurf's proven flow. Reset the RAM address counter to (0,0)
-        // before each write.
-        cmd(&mut spi, &mut cs, &mut dc, 0x4E, &[0x00]);
-        cmd(&mut spi, &mut cs, &mut dc, 0x4F, &[0x00, 0x00]);
-        let _ = OutputPin::set_low(&mut dc);
-        let _ = OutputPin::set_low(&mut cs);
-        let _ = SpiBus::write(&mut spi, &[0x24]);
-        let _ = OutputPin::set_high(&mut dc);
-        for chunk in fb.chunks(64) {
-            let _ = SpiBus::write(&mut spi, chunk);
-        }
-        let _ = OutputPin::set_high(&mut cs);
-
-        // Full refresh (0x22[0xF7] + 0x20).
-        cmd(&mut spi, &mut cs, &mut dc, 0x22, &[0xF7]);
-        cmd(&mut spi, &mut cs, &mut dc, 0x20, &[]);
-        delay_ms(5_000);
-        wait_ready(&mut busy);
-        fill = !fill; // toggle 0x00 ↔ 0xFF
+        delay_ms(1_850);
     }
 }
