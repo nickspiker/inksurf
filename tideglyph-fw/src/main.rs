@@ -16,6 +16,7 @@ use embassy_executor::Spawner;
 use embassy_futures::join::join;
 use embassy_nrf::mode::Async;
 use embassy_nrf::peripherals::RNG;
+use embassy_nrf::wdt::{self, Watchdog, WatchdogHandle};
 use embassy_nrf::{bind_interrupts, rng};
 use embassy_time::{Duration, Timer};
 use nrf_sdc::mpsl::MultiprotocolServiceLayer;
@@ -51,10 +52,10 @@ async fn stage(n: u32) {
     Timer::after(Duration::from_millis(700)).await;
 }
 
-// Runs before statics init, before any interrupt can fire. The UF2 bootloader's MBR forwards exceptions to the BOOTLOADER's vector table for a bare app, so the first interrupt (embassy's time driver) faults → nRF52 lockup → auto-reset crash loop. Pointing VTOR at our own vector table (FLASH ORIGIN 0x1000) routes exceptions directly to us.
+// Runs before statics init. The app is the ACTIVE image at 0x08000, launched by the embassy-boot second stage. embassy-boot's load() sets VTOR here on handoff, but we re-assert it in pre_init so exceptions vector to our table through the app's own reset path too. (FLASH ORIGIN = ACTIVE = 0x08000.)
 #[cortex_m_rt::pre_init]
 unsafe fn pre_init() {
-    (0xE000_ED08 as *mut u32).write_volatile(0x0000_1000);
+    (0xE000_ED08 as *mut u32).write_volatile(0x0000_8000);
 }
 
 bind_interrupts!(struct Irqs {
@@ -69,6 +70,18 @@ bind_interrupts!(struct Irqs {
 #[embassy_executor::task]
 async fn mpsl_task(mpsl: &'static MultiprotocolServiceLayer<'static>) -> ! {
     mpsl.run().await
+}
+
+/// Pet the bootloader's watchdog. The embassy-boot second stage starts the WDT
+/// (WatchdogFlash) and the nRF WDT cannot be stopped once running, so EVERY boot
+/// (not just trial boots) must pet it or the chip resets in ~5 s. A hung app
+/// therefore stops petting → WDT fires → bootloader reverts to the previous image.
+#[embassy_executor::task]
+async fn wdt_pet(mut handle: WatchdogHandle) -> ! {
+    loop {
+        handle.pet();
+        Timer::after(Duration::from_secs(2)).await;
+    }
 }
 
 fn build_sdc<'d, const N: usize>(
@@ -105,6 +118,17 @@ struct XferService {
 async fn main(spawner: Spawner) {
     let p = embassy_nrf::init(Default::default());
     led_init();
+
+    // Inherit + pet the bootloader's watchdog (N=1 handle, matching WatchdogFlash).
+    // Config::try_new returns Some only when the WDT is already running — i.e. we
+    // booted via the embassy-boot stage. Booted bare (no bootloader), it's None
+    // and there's nothing to pet.
+    if let Some(cfg) = wdt::Config::try_new(&p.WDT) {
+        if let Ok((_wdt, [h])) = Watchdog::try_new::<_, 1>(p.WDT, cfg) {
+            spawner.spawn(unwrap!(wdt_pet(h)));
+        }
+    }
+
     stage(1).await; // embassy init OK
 
     let mpsl_p = mpsl::Peripherals::new(p.RTC0, p.TIMER0, p.TEMP, p.PPI_CH19, p.PPI_CH30, p.PPI_CH31);
