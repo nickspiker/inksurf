@@ -56,9 +56,6 @@ fn main() -> ! {
         0,
     );
 
-    // Red diagnostic LED (P0.26 — the one that visibly blinked 2 Hz in the first blink test). Blinked 3× at the top of each loop iteration so we can tell if the SPI sequence is actually executing each cycle.
-    let mut led = port0.p0_26.into_push_pull_output(Level::High).degrade();
-
     // Control pins on the EN04/EN05 board: CS=D7=P1.12, DC=D16=P0.31, RST=D11=P0.15, BUSY=D3=P0.29, panel power-enable EN=D6=P1.11 (driven HIGH).
     let mut panel_en = port1.p1_11.into_push_pull_output(Level::Low).degrade();
     let mut cs = port1.p1_12.into_push_pull_output(Level::High).degrade();
@@ -93,7 +90,8 @@ fn main() -> ! {
     cmd(&mut spi, &mut cs, &mut dc, 0x11, &[0x03]); // data entry mode: X inc, Y inc
     cmd(&mut spi, &mut cs, &mut dc, 0x44, &[0x00, (W / 8 - 1) as u8]); // RAM X window
     cmd(&mut spi, &mut cs, &mut dc, 0x45, &[0x00, 0x00, (H as u16 - 1) as u8, ((H as u16 - 1) >> 8) as u8]); // RAM Y window
-    cmd(&mut spi, &mut cs, &mut dc, 0x3C, &[0x05]); // border
+    cmd(&mut spi, &mut cs, &mut dc, 0x3C, &[0x05]); // border = white
+    cmd(&mut spi, &mut cs, &mut dc, 0x21, &[0x00, 0x80]); // display update control 1 (from inksurf's proven SSD1680 init)
     cmd(&mut spi, &mut cs, &mut dc, 0x18, &[0x80]); // temperature sensor
     cmd(&mut spi, &mut cs, &mut dc, 0x4E, &[0x00]); // RAM X address counter
     cmd(&mut spi, &mut cs, &mut dc, 0x4F, &[0x00, 0x00]); // RAM Y address counter
@@ -105,20 +103,14 @@ fn main() -> ! {
     let fb = unsafe { &mut *core::ptr::addr_of_mut!(FB) };
     let mut fill: u8 = 0x00;
     loop {
-        // 3 quick red blinks: proof the loop (SPI sequence) is executing.
-        for _ in 0..3 {
-            let _ = led.set_low();
-            delay_ms(120);
-            let _ = led.set_high();
-            delay_ms(120);
-        }
         for b in fb.iter_mut() {
             *b = fill;
         }
-        // Reset the RAM address counter to (0,0) before each write.
+        // Write B/W RAM (0x24) with the fill, then RED RAM (0x26) blanked to
+        // zeros — inksurf's proven flow. Reset the RAM address counter to (0,0)
+        // before each write.
         cmd(&mut spi, &mut cs, &mut dc, 0x4E, &[0x00]);
         cmd(&mut spi, &mut cs, &mut dc, 0x4F, &[0x00, 0x00]);
-        // Write B/W RAM (0x24), chunked.
         let _ = OutputPin::set_low(&mut dc);
         let _ = OutputPin::set_low(&mut cs);
         let _ = SpiBus::write(&mut spi, &[0x24]);
@@ -127,7 +119,19 @@ fn main() -> ! {
             let _ = SpiBus::write(&mut spi, chunk);
         }
         let _ = OutputPin::set_high(&mut cs);
-        // Full refresh.
+
+        cmd(&mut spi, &mut cs, &mut dc, 0x4E, &[0x00]);
+        cmd(&mut spi, &mut cs, &mut dc, 0x4F, &[0x00, 0x00]);
+        let _ = OutputPin::set_low(&mut dc);
+        let _ = OutputPin::set_low(&mut cs);
+        let _ = SpiBus::write(&mut spi, &[0x26]);
+        let _ = OutputPin::set_high(&mut dc);
+        for _ in 0..(FB_BYTES / 64) {
+            let _ = SpiBus::write(&mut spi, &[0u8; 64]);
+        }
+        let _ = OutputPin::set_high(&mut cs);
+
+        // Full refresh (0x22[0xF7] + 0x20).
         cmd(&mut spi, &mut cs, &mut dc, 0x22, &[0xF7]);
         cmd(&mut spi, &mut cs, &mut dc, 0x20, &[]);
         delay_ms(5_000);
