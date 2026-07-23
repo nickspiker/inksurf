@@ -96,35 +96,32 @@ fn main() -> ! {
     cmd(&mut spi, &mut cs, &mut dc, 0x4F, &[0x00, 0x00]); // RAM Y address counter
     wait_ready(&mut busy);
 
-    // Build the test frame: 4 horizontal bands alternating black/white. In the
-    // SSD1681 B/W RAM a set bit is white, a clear bit is black.
+    // DIAGNOSTIC: flip the whole panel black ↔ white forever. If the panel is
+    // driven correctly you'll SEE it alternate; if it stays solid white, the
+    // refresh isn't reaching it. This is unambiguous vs a panel that ships white.
     let fb = unsafe { &mut *core::ptr::addr_of_mut!(FB) };
-    for row in 0..H {
-        let byte = if (row * 4 / H) % 2 == 0 { 0x00 } else { 0xFF };
-        for c in 0..ROW_BYTES {
-            fb[row * ROW_BYTES + c] = byte;
-        }
-    }
-
-    // Write the B/W RAM (0x24). Stream the framebuffer in 64-byte chunks — a
-    // single 5000-byte SpiBus::write may not land (init's byte-by-byte writes
-    // clearly worked, since the panel refreshed).
-    let _ = OutputPin::set_low(&mut dc);
-    let _ = OutputPin::set_low(&mut cs);
-    let _ = SpiBus::write(&mut spi, &[0x24]);
-    let _ = OutputPin::set_high(&mut dc);
-    for chunk in fb.chunks(64) {
-        let _ = SpiBus::write(&mut spi, chunk);
-    }
-    let _ = OutputPin::set_high(&mut cs);
-
-    // Full refresh (0x22[0xF7] + 0x20).
-    cmd(&mut spi, &mut cs, &mut dc, 0x22, &[0xF7]); // display update control
-    cmd(&mut spi, &mut cs, &mut dc, 0x20, &[]); // master activation (refresh)
-    delay_ms(4_000);
-    wait_ready(&mut busy);
-
+    let mut fill: u8 = 0x00;
     loop {
-        cpu_delay(64_000_000);
+        for b in fb.iter_mut() {
+            *b = fill;
+        }
+        // Reset the RAM address counter to (0,0) before each write.
+        cmd(&mut spi, &mut cs, &mut dc, 0x4E, &[0x00]);
+        cmd(&mut spi, &mut cs, &mut dc, 0x4F, &[0x00, 0x00]);
+        // Write B/W RAM (0x24), chunked.
+        let _ = OutputPin::set_low(&mut dc);
+        let _ = OutputPin::set_low(&mut cs);
+        let _ = SpiBus::write(&mut spi, &[0x24]);
+        let _ = OutputPin::set_high(&mut dc);
+        for chunk in fb.chunks(64) {
+            let _ = SpiBus::write(&mut spi, chunk);
+        }
+        let _ = OutputPin::set_high(&mut cs);
+        // Full refresh.
+        cmd(&mut spi, &mut cs, &mut dc, 0x22, &[0xF7]);
+        cmd(&mut spi, &mut cs, &mut dc, 0x20, &[]);
+        delay_ms(5_000);
+        wait_ready(&mut busy);
+        fill = !fill; // toggle 0x00 ↔ 0xFF
     }
 }
