@@ -151,8 +151,11 @@ fn main() -> ! {
         let _ = OutputPin::set_low(cs as &mut _);
         let _ = SpiBus::write(spi, &[0x24]);
         let _ = OutputPin::set_high(dc as &mut _);
-        for chunk in fb.chunks(64) {
-            let _ = SpiBus::write(spi, chunk);
+        // Write data byte-by-byte through the SAME path the working init commands
+        // use — rules out the large/chunked DMA transfer as the reason the pixel
+        // data wasn't landing.
+        for &b in fb {
+            let _ = SpiBus::write(spi, &[b]);
         }
         let _ = OutputPin::set_high(cs as &mut _);
         cmd(spi, cs, dc, 0x22, &[0xF7]);
