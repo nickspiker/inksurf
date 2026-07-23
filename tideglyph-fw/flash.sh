@@ -11,8 +11,13 @@ ELF="$CRATE/target/thumbv7em-none-eabihf/release/tideglyph-fw"
 BASE_ADDR="${BASE_ADDR:-0x27000}"         # must match memory.x FLASH ORIGIN (after the S140 SoftDevice)
 FAMILY="0xADA52840"                        # nRF52840 UF2 family id
 
-echo "==> building release"
-cargo build --release --manifest-path "$CRATE/Cargo.toml"
+# cd into the crate so cargo discovers tideglyph-fw/.cargo/config.toml (target +
+# linker), regardless of where this script was invoked from. --target is also
+# passed explicitly as a belt-and-suspenders.
+cd "$CRATE"
+
+echo "==> building release (thumbv7em-none-eabihf)"
+cargo build --release --target thumbv7em-none-eabihf
 
 echo "==> ELF → bin (base $BASE_ADDR)"
 llvm-objcopy -O binary "$ELF" /tmp/tideglyph.bin
