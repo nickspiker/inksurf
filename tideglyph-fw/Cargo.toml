@@ -9,9 +9,12 @@ description = "nRF52840 firmware for the cordless BWRY tide clock (Seeed XIAO + 
 cortex-m = { version = "0.7", features = ["inline-asm"] }
 cortex-m-rt = "0.7"
 panic-halt = "0.2"
-# Blocking HAL for P0 bring-up (SPIM + GPIO). Embassy comes later for BLE/power.
-nrf52840-hal = "0.18"
-embedded-hal = "1.0"
+# NOTE: nrf52840-hal + embedded-hal are needed by the panel driver but removed
+# for the current bare RGB-cycle diagnostic (referencing neither the HAL nor the
+# PAC while they're linked makes --gc-sections drop the interrupt vectors). Re-add
+# when restoring the panel driver:
+#   nrf52840-hal = "0.18"
+#   embedded-hal = "1.0"
 
 [profile.release]
 opt-level = "z"
