@@ -159,10 +159,11 @@ fn main() -> ! {
     let _ = OutputPin::set_high(&mut cs);
 
     cmd(&mut spi, &mut cs, &mut dc, 0x12, &[0x00]); // DRF refresh
-    delay_ms(50);
-    wait_ready(&mut busy);
-
-    cmd(&mut spi, &mut cs, &mut dc, 0x02, &[]); // POWER OFF
+    // Unconditional long wait — do NOT trust BUSY (if it's mis-wired it reads
+    // high and we'd power off mid-refresh, blanking the panel). A BWRY full
+    // refresh is several seconds; give it 25 s, then leave the panel powered.
+    delay_ms(25_000);
+    // (No power-off — keep it simple; the image is latched by the refresh.)
 
     // Completed the full sequence: blue off, green heartbeat. Blue-stuck-on (no
     // green) means it hung mid-init; green blinking means everything finished.
