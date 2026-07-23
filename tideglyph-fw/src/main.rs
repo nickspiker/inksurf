@@ -12,12 +12,17 @@
 #![no_main]
 
 use defmt::{info, unwrap};
+use embassy_boot::{AlignedBuffer, FirmwareUpdater, FirmwareUpdaterConfig, State};
+use embassy_embedded_hal::adapter::BlockingAsync;
 use embassy_executor::Spawner;
 use embassy_futures::join::join;
 use embassy_nrf::mode::Async;
+use embassy_nrf::nvmc::Nvmc;
 use embassy_nrf::peripherals::RNG;
 use embassy_nrf::wdt::{self, Watchdog, WatchdogHandle};
 use embassy_nrf::{bind_interrupts, rng};
+use embassy_sync::blocking_mutex::raw::NoopRawMutex;
+use embassy_sync::mutex::Mutex;
 use embassy_time::{Duration, Timer};
 use nrf_sdc::mpsl::MultiprotocolServiceLayer;
 use nrf_sdc::{self as sdc, mpsl};
@@ -181,6 +186,22 @@ async fn main(spawner: Spawner) {
         }
     };
     stage(3).await; // SDC built
+
+    // Self-test proxy: reaching here means embassy + MPSL + the BLE controller
+    // all came up. Confirm this boot so that if the bootloader just swapped in a
+    // new image, the swap sticks (BOOT_MAGIC) instead of reverting on the next
+    // power-cycle. Harmless no-op on a normal (non-swapped) boot. If a bad image
+    // crashes before this point, mark_booted is never reached -> WDT -> revert.
+    {
+        let nvmc = Mutex::<NoopRawMutex, _>::new(BlockingAsync::new(Nvmc::new(p.NVMC)));
+        let fw_config = FirmwareUpdaterConfig::from_linkerfile(&nvmc, &nvmc);
+        let mut aligned = AlignedBuffer([0u8; 4]);
+        let mut updater = FirmwareUpdater::new(fw_config, &mut aligned.0);
+        if let Ok(State::Revert) = updater.get_state().await {
+            info!("[ota] previous update was REVERTED by the bootloader");
+        }
+        let _ = updater.mark_booted().await;
+    }
 
     run(sdc).await;
 }

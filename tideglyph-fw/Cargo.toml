@@ -29,6 +29,12 @@ cortex-m-rt = "0.7.0"
 static_cell = "2"
 blake3 = { version = "1", default-features = false }
 
+# OTA: chip-agnostic embassy-boot core (generic over NorFlash) fed the app's own
+# Nvmc — 0.7 pairs with the embassy-sync 0.8 / embassy-embedded-hal 0.6 the app
+# already locks, so no second embassy-nrf/embassy-sync gets pulled in.
+embassy-boot = { version = "0.7", default-features = false, features = ["defmt"] }
+embassy-embedded-hal = { version = "0.6", default-features = false }
+
 [patch.crates-io]
 nrf-sdc = { git = "https://github.com/alexmoon/nrf-sdc.git", rev = "abe49d22ebfc85fae134eb082fbfddf752016a55" }
 nrf-mpsl = { git = "https://github.com/alexmoon/nrf-sdc.git", rev = "abe49d22ebfc85fae134eb082fbfddf752016a55" }
