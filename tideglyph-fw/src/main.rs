@@ -1,11 +1,17 @@
-//! tideglyph BLE bring-up: advertise as "tideglyph" with staged LED diagnostics on D9 = P1.14 (user-soldered LED, active high). Stages: 1 blink = embassy init OK, 2 = MPSL up, 3 = SDC built, 4 = advertising, then a short blip every 2 s while the BLE runner is alive.
+//! tideglyph BLE transfer-test firmware: connectable GATT peripheral advertising as "tideglyph" with a chunked-transfer service that BLAKE3-hashes everything written to it. This is the radio+integrity round trip for the OTA pipeline: host streams bytes → device hashes on the fly → host reads the hash back and compares. No flash writes yet — RAM/hash only.
+//!
+//! Transfer service protocol (128-bit UUIDs, base b5f9xxxx-2d5a-4f3c-9b1a-1d2e3f405060):
+//!   ctrl  (0002, write):        [0x01] BEGIN — reset hasher + byte count. [0x02] COMMIT — finalize hash.
+//!   data  (0003, write/wnr):    every write's payload is appended to the running BLAKE3.
+//!   hash  (0004, read):         last COMMITted 32-byte BLAKE3.
+//!   count (0005, read):         total bytes received since BEGIN, little-endian u32.
+//!
+//! Diagnostic LED on D9 = P1.14 (user-soldered, active high): boot stages 1=embassy, 2=MPSL, blip=rng, 3=SDC; SDC-build errors blink an errno signature (5=ENOMEM, 4=EINVAL, 6=EPERM, 3=other). After boot: LED OFF while advertising, ON while a central is connected.
 
 #![no_std]
 #![no_main]
 
-use bt_hci::controller::ControllerCmdSync;
-use bt_hci::cmd::le::*;
-use defmt::unwrap;
+use defmt::{info, unwrap};
 use embassy_executor::Spawner;
 use embassy_futures::join::join;
 use embassy_nrf::mode::Async;
@@ -17,6 +23,9 @@ use nrf_sdc::{self as sdc, mpsl};
 use static_cell::StaticCell;
 use trouble_host::prelude::*;
 use {defmt_rtt as _, panic_probe as _};
+
+const CONNECTIONS_MAX: usize = 1;
+const L2CAP_CHANNELS_MAX: usize = 2; // signal + att
 
 // D9 = P1.14 diagnostic LED, direct registers (independent of any HAL state).
 const P1_BASE: u32 = 0x5000_0300;
@@ -42,7 +51,7 @@ async fn stage(n: u32) {
     Timer::after(Duration::from_millis(700)).await;
 }
 
-// Runs before statics init, before any interrupt can fire. The UF2 bootloader's MBR forwards exceptions to the BOOTLOADER's vector table for a bare app, so the first interrupt (embassy's time driver) faults → nRF52 lockup → auto-reset → the observed ~1.5 Hz crash-boot loop. Pointing VTOR at our own vector table (FLASH ORIGIN 0x1000) routes exceptions directly to us.
+// Runs before statics init, before any interrupt can fire. The UF2 bootloader's MBR forwards exceptions to the BOOTLOADER's vector table for a bare app, so the first interrupt (embassy's time driver) faults → nRF52 lockup → auto-reset crash loop. Pointing VTOR at our own vector table (FLASH ORIGIN 0x1000) routes exceptions directly to us.
 #[cortex_m_rt::pre_init]
 unsafe fn pre_init() {
     (0xE000_ED08 as *mut u32).write_volatile(0x0000_1000);
@@ -68,7 +77,28 @@ fn build_sdc<'d, const N: usize>(
     mpsl: &'d MultiprotocolServiceLayer,
     mem: &'d mut sdc::Mem<N>,
 ) -> Result<nrf_sdc::SoftdeviceController<'d>, nrf_sdc::Error> {
-    sdc::Builder::new()?.support_adv().build(p, rng, mpsl, mem)
+    sdc::Builder::new()?
+        .support_adv()
+        .support_peripheral()
+        .build(p, rng, mpsl, mem)
+}
+
+// GATT server: transfer-test service.
+#[gatt_server]
+struct Server {
+    xfer: XferService,
+}
+
+#[gatt_service(uuid = "b5f90001-2d5a-4f3c-9b1a-1d2e3f405060")]
+struct XferService {
+    #[characteristic(uuid = "b5f90002-2d5a-4f3c-9b1a-1d2e3f405060", write)]
+    ctrl: u8,
+    #[characteristic(uuid = "b5f90003-2d5a-4f3c-9b1a-1d2e3f405060", write, write_without_response, value = [0u8; 244])]
+    data: [u8; 244],
+    #[characteristic(uuid = "b5f90004-2d5a-4f3c-9b1a-1d2e3f405060", read)]
+    hash: [u8; 32],
+    #[characteristic(uuid = "b5f90005-2d5a-4f3c-9b1a-1d2e3f405060", read)]
+    count: [u8; 4],
 }
 
 #[embassy_executor::main]
@@ -95,17 +125,17 @@ async fn main(spawner: Spawner) {
         p.PPI_CH27, p.PPI_CH28, p.PPI_CH29,
     );
     let mut rng = rng::Rng::new(p.RNG, Irqs);
-    // Quick pre-marker: rng + peripherals constructed (a lone 60 ms blip before the build attempt).
+    // Quick pre-marker: rng + peripherals constructed.
     led(true);
     Timer::after(Duration::from_millis(60)).await;
     led(false);
     Timer::after(Duration::from_millis(300)).await;
 
-    let mut sdc_mem = sdc::Mem::<4096>::new();
+    // 8192: GATT peripheral needs more than the advertise-only 4096 (the example's GATT config uses 4720; ENOMEM here blinks 5s).
+    let mut sdc_mem = sdc::Mem::<8192>::new();
     let sdc = match build_sdc(sdc_p, &mut rng, mpsl, &mut sdc_mem) {
         Ok(s) => s,
         Err(e) => {
-            // Blink the failure signature forever: 5 = ENOMEM (pool too small), 4 = EINVAL, 6 = EPERM, 3 = anything else.
             let n = if e == nrf_sdc::Error::ENOMEM {
                 5
             } else if e == nrf_sdc::Error::EINVAL {
@@ -131,60 +161,142 @@ async fn main(spawner: Spawner) {
     run(sdc).await;
 }
 
-async fn run<C>(controller: C)
-where
-    C: Controller
-        + for<'t> ControllerCmdSync<LeSetExtAdvData<'t>>
-        + ControllerCmdSync<LeClearAdvSets>
-        + ControllerCmdSync<LeSetExtAdvParams>
-        + ControllerCmdSync<LeSetAdvSetRandomAddr>
-        + ControllerCmdSync<LeReadNumberOfSupportedAdvSets>
-        + for<'t> ControllerCmdSync<LeSetExtAdvEnable<'t>>
-        + for<'t> ControllerCmdSync<LeSetExtScanResponseData<'t>>,
-{
+async fn run<C: Controller>(controller: C) {
     let address: Address = Address::random([0xff, 0x8f, 0x1a, 0x05, 0xe4, 0xff]);
 
-    let mut resources: HostResources<DefaultPacketPool, 0, 0> = HostResources::new();
+    let mut resources: HostResources<DefaultPacketPool, CONNECTIONS_MAX, L2CAP_CHANNELS_MAX> = HostResources::new();
     let stack = trouble_host::new(controller, &mut resources)
         .set_random_address(address)
         .build();
-    let mut runner = stack.runner();
+    let runner = stack.runner();
     let mut peripheral = stack.peripheral();
 
-    let mut adv_data = [0; 31];
-    let len = AdStructure::encode_slice(
-        &[
-            AdStructure::CompleteLocalName(b"tideglyph"),
-            AdStructure::Flags(LE_GENERAL_DISCOVERABLE | BR_EDR_NOT_SUPPORTED),
-        ],
-        &mut adv_data[..],
-    )
-    .unwrap();
+    let server = unwrap!(Server::new_with_config(GapConfig::Peripheral(PeripheralConfig {
+        name: "tideglyph",
+        appearance: &appearance::power_device::GENERIC_POWER_DEVICE,
+    })));
 
-    let _ = join(runner.run(), async {
+    let _ = join(ble_task(runner), async {
         loop {
-            let mut params = AdvertisementParameters::default();
-            params.interval_min = Duration::from_millis(100);
-            params.interval_max = Duration::from_millis(100);
-            let _advertiser = peripheral
-                .advertise(
-                    &params,
-                    Advertisement::NonconnectableScannableUndirected {
-                        adv_data: &adv_data[..len],
-                        scan_data: &[],
-                    },
-                )
-                .await
-                .unwrap();
-            stage(4).await; // advertising live
-            loop {
-                // Heartbeat blip: BLE runner alive.
-                led(true);
-                Timer::after(Duration::from_millis(60)).await;
-                led(false);
-                Timer::after(Duration::from_millis(1940)).await;
+            led(false); // advertising: LED off
+            match advertise("tideglyph", &mut peripheral, &server).await {
+                Ok(conn) => {
+                    led(true); // connected: LED on
+                    let _ = xfer_task(&server, &conn).await;
+                }
+                Err(_) => {
+                    // Brief triple-flutter on advertise error, then retry.
+                    for _ in 0..3 {
+                        led(true);
+                        Timer::after(Duration::from_millis(60)).await;
+                        led(false);
+                        Timer::after(Duration::from_millis(60)).await;
+                    }
+                }
             }
         }
     })
     .await;
+}
+
+async fn ble_task<C: Controller, P: PacketPool>(mut runner: Runner<'_, C, P>) {
+    loop {
+        if let Err(e) = runner.run().await {
+            let e = defmt::Debug2Format(&e);
+            panic!("[ble_task] error: {:?}", e);
+        }
+    }
+}
+
+/// Handle the transfer service until the connection closes: BEGIN resets the hasher, data writes feed it, COMMIT finalizes into the hash characteristic.
+async fn xfer_task<P: PacketPool>(server: &Server<'_>, conn: &GattConnection<'_, '_, P>) -> Result<(), Error> {
+    let ctrl = server.xfer.ctrl;
+    let data = server.xfer.data;
+    let hash = server.xfer.hash;
+    let count = server.xfer.count;
+
+    let mut hasher = blake3::Hasher::new();
+    let mut total: u32 = 0;
+    let mut digest = [0u8; 32];
+
+    let _reason = loop {
+        match conn.next().await {
+            GattConnectionEvent::Disconnected { reason } => break reason,
+            GattConnectionEvent::Gatt { event } => {
+                let reply = match event {
+                    // Reads are answered by the server from the attribute table; handlers below keep hash/count stored there up to date. (Do NOT use accept_unprocessed(&data) for reads — at this trouble rev it slices the response by MTU without bounding by data length and panics for short values.)
+                    GattEvent::Read(event) => event.accept(),
+                    GattEvent::Write(event) => {
+                        if event.handle() == data.handle {
+                            event.with_data(|_offset, bytes| {
+                                hasher.update(bytes);
+                                total = total.wrapping_add(bytes.len() as u32);
+                            });
+                            event.accept_unprocessed()
+                        } else if event.handle() == ctrl.handle {
+                            let mut op = 0u8;
+                            event.with_data(|_offset, bytes| {
+                                if !bytes.is_empty() {
+                                    op = bytes[0];
+                                }
+                            });
+                            match op {
+                                0x01 => {
+                                    hasher.reset();
+                                    total = 0;
+                                    digest = [0u8; 32];
+                                    let _ = server.set(&hash, &digest);
+                                    let _ = server.set(&count, &[0u8; 4]);
+                                    info!("[xfer] BEGIN");
+                                }
+                                0x02 => {
+                                    digest = *hasher.finalize().as_bytes();
+                                    let _ = server.set(&hash, &digest);
+                                    let _ = server.set(&count, &total.to_le_bytes());
+                                    info!("[xfer] COMMIT: {} bytes", total);
+                                }
+                                _ => {}
+                            }
+                            event.accept_unprocessed()
+                        } else {
+                            event.accept()
+                        }
+                    }
+                    _ => event.accept(),
+                };
+                match reply {
+                    Ok(reply) => reply.send().await,
+                    Err(_) => {}
+                }
+            }
+            _ => {}
+        }
+    };
+    Ok(())
+}
+
+async fn advertise<'values, 'server, C: Controller>(
+    name: &'values str,
+    peripheral: &mut Peripheral<'values, C, DefaultPacketPool>,
+    server: &'server Server<'values>,
+) -> Result<GattConnection<'values, 'server, DefaultPacketPool>, BleHostError<C::Error>> {
+    let mut advertiser_data = [0; 31];
+    let len = AdStructure::encode_slice(
+        &[
+            AdStructure::Flags(LE_GENERAL_DISCOVERABLE | BR_EDR_NOT_SUPPORTED),
+            AdStructure::CompleteLocalName(name.as_bytes()),
+        ],
+        &mut advertiser_data[..],
+    )?;
+    let advertiser = peripheral
+        .advertise(
+            &Default::default(),
+            Advertisement::ConnectableScannableUndirected {
+                adv_data: &advertiser_data[..len],
+                scan_data: &[],
+            },
+        )
+        .await?;
+    let conn = advertiser.accept().await?.with_attribute_server(server)?;
+    Ok(conn)
 }

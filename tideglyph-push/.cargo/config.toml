@@ -1,0 +1,3 @@
+# Host tool — override the repo-root config (which targets the RP2040's thumbv6m).
+[build]
+target = "x86_64-unknown-linux-gnu"

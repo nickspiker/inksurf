@@ -27,6 +27,7 @@ panic-probe = { version = "1.0", features = ["print-defmt"] }
 cortex-m = { version = "0.7.6" }
 cortex-m-rt = "0.7.0"
 static_cell = "2"
+blake3 = { version = "1", default-features = false }
 
 [patch.crates-io]
 nrf-sdc = { git = "https://github.com/alexmoon/nrf-sdc.git", rev = "abe49d22ebfc85fae134eb082fbfddf752016a55" }
