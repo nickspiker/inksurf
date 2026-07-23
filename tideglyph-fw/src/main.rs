@@ -15,14 +15,15 @@ use panic_halt as _;
 use hal::gpio::{p0, p1, Level};
 use hal::spim::{Frequency, Pins, Spim, MODE_0};
 
-// Diagnostic LED on D0 = P0.02, driven by DIRECT registers (independent of the
-// HAL, so it reports even if the HAL is what faults). Active high: drive high =
-// LED on. Wire an LED + ~470Ω from D0 to GND.
-const P0_BASE: u32 = 0x5000_0000;
-const P0_DIRSET: u32 = P0_BASE + 0x518;
-const P0_OUTSET: u32 = P0_BASE + 0x508;
-const P0_OUTCLR: u32 = P0_BASE + 0x50C;
-const LED_PIN: u32 = 2; // P0.02 = D0
+// Diagnostic LED on D9 = P1.14 (the SPI MISO line — unused by a write-only
+// e-paper panel, so a safe sacrificial pin). Driven by DIRECT registers
+// (independent of the HAL, so it reports even if the HAL is what faults).
+// Active high: drive high = LED on. Wire an LED + ~470Ω from D9 to GND.
+const P1_BASE: u32 = 0x5000_0300;
+const P0_DIRSET: u32 = P1_BASE + 0x518;
+const P0_OUTSET: u32 = P1_BASE + 0x508;
+const P0_OUTCLR: u32 = P1_BASE + 0x50C;
+const LED_PIN: u32 = 14; // P1.14 = D9
 
 #[inline(always)]
 fn led_init() {
