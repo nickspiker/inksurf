@@ -71,13 +71,18 @@ fn main() -> ! {
         0,
     );
 
-    // Control pins: CS=P0.03 (D1), DC=P0.29 (D3), RST=P0.02 (D0), BUSY=P0.28 (D2).
-    let mut cs = port0.p0_03.into_push_pull_output(Level::High).degrade();
-    let mut dc = port0.p0_29.into_push_pull_output(Level::Low).degrade();
-    let mut rst = port0.p0_02.into_push_pull_output(Level::High).degrade();
-    let mut busy = port0.p0_28.into_floating_input().degrade();
+    // Control pins on the EN04/EN05 board (D-label → nRF GPIO from the Plus
+    // variant): CS=D7=P1.12, DC=D16=P0.31, RST=D11=P0.15, BUSY=D3=P0.29,
+    // and the panel power-enable EN=D6=P1.11 (must be driven HIGH to power it).
+    let mut panel_en = port1.p1_11.into_push_pull_output(Level::Low).degrade();
+    let mut cs = port1.p1_12.into_push_pull_output(Level::High).degrade();
+    let mut dc = port0.p0_31.into_push_pull_output(Level::Low).degrade();
+    let mut rst = port0.p0_15.into_push_pull_output(Level::High).degrade();
+    let mut busy = port0.p0_29.into_floating_input().degrade();
 
-    // Hardware reset.
+    // Power the panel, let its rails settle, then hardware reset.
+    let _ = panel_en.set_high();
+    delay_ms(10);
     let _ = rst.set_low();
     delay_ms(20);
     let _ = rst.set_high();
