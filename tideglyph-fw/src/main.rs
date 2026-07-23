@@ -1,6 +1,6 @@
-//! P0 panel bring-up: drive the **Seeed 1.54" mono** panel (SSD1681, 200×200, black/white — model GDEY0154D67) via the Seeed nRF52840 + EN04 board, and push a black/white band test frame.
+//! P0 panel bring-up: drive the Seeed 1.54" **BWRY** panel (JD79660, 200×200, 4-color black/white/yellow/red) via the Seeed nRF52840 + EN04/EN05 board, and push a 4-color band test frame.
 //!
-//! This is a monochrome SSD1681 panel, NOT a BWRY colour panel — the display is black & white only. Config from Seeed's Setup505 (SSD1681): 1 bit/pixel, RAMWR = 0x24, full refresh = 0x22[0xF7] + 0x20. BUSY polarity is INVERTED vs the JD79xxx panels: HIGH = busy, LOW = ready. Pins are the Seeed EN04 board's nRF GPIO — matched pair, so pin compatibility is guaranteed.
+//! Config from Seeed's Setup517 (JD79660): 2 bits/pixel (4 px/byte), pixel write via DTM = 0x10, refresh = 0x12 + [0x00], BUSY LOW = busy (opposite of the SSD1681). Runs BARE at 0x1000 (no SoftDevice — see memory.x). Pins are the EN04/EN05 board's nRF GPIO. Diagnostic LED on D9 = P1.14.
 
 #![no_std]
 #![no_main]
@@ -15,72 +15,61 @@ use panic_halt as _;
 use hal::gpio::{p0, p1, Level};
 use hal::spim::{Frequency, Pins, Spim, MODE_0};
 
-
-// Diagnostic LED on D9 = P1.14 (the SPI MISO line — unused by a write-only
-// e-paper panel, so a safe sacrificial pin). Driven by DIRECT registers
-// (independent of the HAL, so it reports even if the HAL is what faults).
-// Active high: drive high = LED on. Wire an LED + ~470Ω from D9 to GND.
+// Diagnostic LED on D9 = P1.14 (unused MISO), driven by DIRECT registers.
 const P1_BASE: u32 = 0x5000_0300;
-const P0_DIRSET: u32 = P1_BASE + 0x518;
-const P0_OUTSET: u32 = P1_BASE + 0x508;
-const P0_OUTCLR: u32 = P1_BASE + 0x50C;
+const LED_DIRSET: u32 = P1_BASE + 0x518;
+const LED_OUTSET: u32 = P1_BASE + 0x508;
+const LED_OUTCLR: u32 = P1_BASE + 0x50C;
 const LED_PIN: u32 = 14; // P1.14 = D9
 
 #[inline(always)]
 fn led_init() {
-    unsafe { core::ptr::write_volatile(P0_DIRSET as *mut u32, 1 << LED_PIN) }
+    unsafe { core::ptr::write_volatile(LED_DIRSET as *mut u32, 1 << LED_PIN) }
 }
 #[inline(always)]
 fn led(on: bool) {
-    let reg = if on { P0_OUTSET } else { P0_OUTCLR };
+    let reg = if on { LED_OUTSET } else { LED_OUTCLR };
     unsafe { core::ptr::write_volatile(reg as *mut u32, 1 << LED_PIN) }
 }
-fn led_blink(times: u32) {
-    for _ in 0..times {
-        led(true);
-        delay_ms(120);
-        led(false);
-        delay_ms(120);
-    }
-}
 
-// SSD1681 mono: 200×200, 1 bit/pixel, 8 px/byte.
+// JD79660 BWRY: 200×200, 2 bits/pixel, 4 px/byte.
 const W: usize = 200;
 const H: usize = 200;
-const ROW_BYTES: usize = W / 8; // 25
-const FB_BYTES: usize = ROW_BYTES * H; // 5000
+const ROW_BYTES: usize = W / 4; // 50
+const FB_BYTES: usize = ROW_BYTES * H; // 10000
 
-// ~64 MHz core → cycles per millisecond. Init delays only need a lower bound, so exactness doesn't matter.
+// 2-bit colour codes (JD79660 / inksurf), packed 4/byte.
+const BLACK: u8 = 0b00;
+const WHITE: u8 = 0b01;
+const YELLOW: u8 = 0b10;
+const RED: u8 = 0b11;
+
 fn delay_ms(ms: u32) {
     cpu_delay(64_000 * ms);
 }
 
-/// Wait for the chip to signal ready. SSD1681 BUSY is HIGH while busy, so wait until it goes LOW. Bounded (~5 s) so a mis-wired or floating BUSY can't deadlock with no feedback.
+/// JD79660 BUSY is LOW while busy, so wait until it goes HIGH. Bounded (~5 s).
 fn wait_ready<P: InputPin>(busy: &mut P) {
     for _ in 0..5000 {
-        if busy.is_low().unwrap_or(true) {
+        if busy.is_high().unwrap_or(true) {
             return;
         }
         delay_ms(1);
     }
 }
 
-// Framebuffer in RAM (SPIM EasyDMA can't stream from flash).
 static mut FB: [u8; FB_BYTES] = [0; FB_BYTES];
 
 #[entry]
 fn main() -> ! {
-    // Stage 1: app booted (direct registers, before any HAL). If you never see
-    // even 1 blink, the app isn't running / LED is miswired.
     led_init();
-    led_blink(1);
-    delay_ms(800);
+    led(true);
 
     let p = hal::pac::Peripherals::take().unwrap();
     let port0 = p0::Parts::new(p.P0);
     let port1 = p1::Parts::new(p.P1);
 
-    // SPI pins: SCLK=P1.13 (D8), MOSI=P1.15 (D10). Panel is write-only (no MISO).
+    // SPI pins: SCLK=P1.13 (D8), MOSI=P1.15 (D10).
     let sck = port1.p1_13.into_push_pull_output(Level::Low).degrade();
     let mosi = port1.p1_15.into_push_pull_output(Level::Low).degrade();
     let mut spi = Spim::new(
@@ -91,24 +80,20 @@ fn main() -> ! {
         0,
     );
 
-    // Stage 2: peripherals + Spim::new survived (the HAL SPI init is a fault suspect).
-    led_blink(2);
-    delay_ms(800);
-
-    // Control pins on the EN04/EN05 board: CS=D7=P1.12, DC=D16=P0.31, RST=D11=P0.15, BUSY=D3=P0.29, panel power-enable EN=D6=P1.11 (driven HIGH).
+    // Control pins: CS=D7=P1.12, DC=D16=P0.31, RST=D11=P0.15, BUSY=D3=P0.29, EN=D6=P1.11.
     let mut panel_en = port1.p1_11.into_push_pull_output(Level::Low).degrade();
     let mut cs = port1.p1_12.into_push_pull_output(Level::High).degrade();
     let mut dc = port0.p0_31.into_push_pull_output(Level::Low).degrade();
     let mut rst = port0.p0_15.into_push_pull_output(Level::High).degrade();
     let mut busy = port0.p0_29.into_floating_input().degrade();
 
-    // Power the panel, settle, hardware reset.
+    // Power, settle, reset (JD79660 timing: 50 ms low / 100 ms high).
     let _ = panel_en.set_high();
     delay_ms(10);
     let _ = rst.set_low();
-    delay_ms(10);
+    delay_ms(50);
     let _ = rst.set_high();
-    delay_ms(10);
+    delay_ms(100);
     wait_ready(&mut busy);
 
     let cmd = |spi: &mut Spim<hal::pac::SPIM0>, cs: &mut _, dc: &mut _, c: u8, data: &[u8]| {
@@ -122,65 +107,47 @@ fn main() -> ! {
         let _ = OutputPin::set_high(cs as &mut _);
     };
 
-    // Init (Seeed Setup505 / SSD1681, 200×200).
-    cmd(&mut spi, &mut cs, &mut dc, 0x12, &[]); // software reset
-    wait_ready(&mut busy);
-    cmd(&mut spi, &mut cs, &mut dc, 0x01, &[(H as u16 - 1) as u8, ((H as u16 - 1) >> 8) as u8, 0x00]); // driver output control
-    cmd(&mut spi, &mut cs, &mut dc, 0x11, &[0x03]); // data entry mode: X inc, Y inc
-    cmd(&mut spi, &mut cs, &mut dc, 0x44, &[0x00, (W / 8 - 1) as u8]); // RAM X window
-    cmd(&mut spi, &mut cs, &mut dc, 0x45, &[0x00, 0x00, (H as u16 - 1) as u8, ((H as u16 - 1) >> 8) as u8]); // RAM Y window
-    cmd(&mut spi, &mut cs, &mut dc, 0x3C, &[0x05]); // border = white
-    cmd(&mut spi, &mut cs, &mut dc, 0x18, &[0x80]); // temperature sensor
-    cmd(&mut spi, &mut cs, &mut dc, 0x4E, &[0x00]); // RAM X address counter
-    cmd(&mut spi, &mut cs, &mut dc, 0x4F, &[0x00, 0x00]); // RAM Y address counter
+    // Init (Seeed Setup517 / JD79660, 200×200 BWRY).
+    cmd(&mut spi, &mut cs, &mut dc, 0x4D, &[0x78]);
+    cmd(&mut spi, &mut cs, &mut dc, 0x00, &[0x0F, 0x29]); // PSR
+    cmd(&mut spi, &mut cs, &mut dc, 0x06, &[0x0D, 0x12, 0x30, 0x20, 0x19, 0x2A, 0x22]); // BTST_P
+    cmd(&mut spi, &mut cs, &mut dc, 0x50, &[0x37]); // CDI
+    cmd(&mut spi, &mut cs, &mut dc, 0x61, &[0x00, 0xC8, 0x00, 0xC8]); // TRES 200×200
+    cmd(&mut spi, &mut cs, &mut dc, 0xE9, &[0x01]);
+    cmd(&mut spi, &mut cs, &mut dc, 0x30, &[0x08]); // PLL
+    cmd(&mut spi, &mut cs, &mut dc, 0x04, &[]); // POWER ON
     wait_ready(&mut busy);
 
-    // Stage 3: panel reset + full init sequence completed (all those SPI writes went out and the post-power-on BUSY wait returned).
-    led_blink(3);
-    delay_ms(800);
-
+    // Build a 4-colour band test frame: black / white / yellow / red, top to bottom.
     let fb = unsafe { &mut *core::ptr::addr_of_mut!(FB) };
-
-    // Write the whole B/W RAM (0x24) from fb, then full-refresh. Reset the RAM
-    // address counter to (0,0) first.
-    let mut show = |spi: &mut Spim<hal::pac::SPIM0>, cs: &mut _, dc: &mut _, busy: &mut _, fb: &[u8]| {
-        cmd(spi, cs, dc, 0x4E, &[0x00]);
-        cmd(spi, cs, dc, 0x4F, &[0x00, 0x00]);
-        let _ = OutputPin::set_low(dc as &mut _);
-        let _ = OutputPin::set_low(cs as &mut _);
-        let _ = SpiBus::write(spi, &[0x24]);
-        let _ = OutputPin::set_high(dc as &mut _);
-        // Write data byte-by-byte through the SAME path the working init commands
-        // use — rules out the large/chunked DMA transfer as the reason the pixel
-        // data wasn't landing.
-        for &b in fb {
-            let _ = SpiBus::write(spi, &[b]);
-        }
-        let _ = OutputPin::set_high(cs as &mut _);
-        cmd(spi, cs, dc, 0x22, &[0xF7]);
-        cmd(spi, cs, dc, 0x20, &[]);
-        delay_ms(2_000);
-        wait_ready(busy);
-    };
-
-    // First clear to solid white to establish a clean base (kill ghosting).
-    for b in fb.iter_mut() {
-        *b = 0xFF;
-    }
-    show(&mut spi, &mut cs, &mut dc, &mut busy, fb);
-
-    // Then a static 4-band pattern: 50-row bands black / white / black / white,
-    // top to bottom. This is a KNOWN reference — how it actually renders tells us
-    // the pixel format (bit order, row layout) precisely.
     for row in 0..H {
-        let byte = if (row / 50) % 2 == 0 { 0x00 } else { 0xFF };
+        let color = match row * 4 / H {
+            0 => BLACK,
+            1 => WHITE,
+            2 => YELLOW,
+            _ => RED,
+        };
+        let byte = (color << 6) | (color << 4) | (color << 2) | color;
         for c in 0..ROW_BYTES {
             fb[row * ROW_BYTES + c] = byte;
         }
     }
-    show(&mut spi, &mut cs, &mut dc, &mut busy, fb);
 
-    // Done — just heartbeat the LED so we know it's alive; leave the image up.
+    // Stream the framebuffer (DTM = 0x10), then refresh (DRF = 0x12 + [0x00]).
+    let _ = OutputPin::set_low(&mut dc);
+    let _ = OutputPin::set_low(&mut cs);
+    let _ = SpiBus::write(&mut spi, &[0x10]);
+    let _ = OutputPin::set_high(&mut dc);
+    for &b in fb.iter() {
+        let _ = SpiBus::write(&mut spi, &[b]);
+    }
+    let _ = OutputPin::set_high(&mut cs);
+
+    cmd(&mut spi, &mut cs, &mut dc, 0x12, &[0x00]); // DRF refresh
+    delay_ms(2_000);
+    wait_ready(&mut busy);
+
+    // Done — heartbeat the LED, leave the image up.
     loop {
         led(true);
         delay_ms(150);
