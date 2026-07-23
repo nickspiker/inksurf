@@ -106,14 +106,19 @@ fn main() -> ! {
         }
     }
 
-    // Write the B/W RAM (0x24), then full refresh (0x22[0xF7] + 0x20).
+    // Write the B/W RAM (0x24). Stream the framebuffer in 64-byte chunks — a
+    // single 5000-byte SpiBus::write may not land (init's byte-by-byte writes
+    // clearly worked, since the panel refreshed).
     let _ = OutputPin::set_low(&mut dc);
     let _ = OutputPin::set_low(&mut cs);
     let _ = SpiBus::write(&mut spi, &[0x24]);
     let _ = OutputPin::set_high(&mut dc);
-    let _ = SpiBus::write(&mut spi, &fb[..]);
+    for chunk in fb.chunks(64) {
+        let _ = SpiBus::write(&mut spi, chunk);
+    }
     let _ = OutputPin::set_high(&mut cs);
 
+    // Full refresh (0x22[0xF7] + 0x20).
     cmd(&mut spi, &mut cs, &mut dc, 0x22, &[0xF7]); // display update control
     cmd(&mut spi, &mut cs, &mut dc, 0x20, &[]); // master activation (refresh)
     delay_ms(4_000);
