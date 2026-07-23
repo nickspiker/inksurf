@@ -1,6 +1,6 @@
-//! P0 panel bring-up: drive the Seeed 1.54" **BWRY** panel (JD79660, 200×200, 4-color black/white/yellow/red) via the Seeed nRF52840 + EN04/EN05 board, and push a 4-color band test frame.
+//! P0 panel bring-up: drive the **Adafruit 6414 BWRY** panel (JD79667, 384×180 landscape = 180×384 chip coords, 4-color black/white/yellow/red) via the Seeed nRF52840 + EN04/EN05 board, and push a 4-color band test frame.
 //!
-//! Config from Seeed's Setup517 (JD79660): 2 bits/pixel (4 px/byte), pixel write via DTM = 0x10, refresh = 0x12 + [0x00], BUSY LOW = busy (opposite of the SSD1681). Runs BARE at 0x1000 (no SoftDevice — see memory.x). Pins are the EN04/EN05 board's nRF GPIO. Diagnostic LED on D9 = P1.14.
+//! Geometry + init from inksurf's proven src/panel_jd79667.rs: 2 bits/pixel (4 px/byte), TRES 180×384 → [0x00,0xB4,0x01,0x80], DTM = 0x10, refresh = 0x12 + [0x00], BUSY LOW = busy. Runs BARE at 0x1000 (no SoftDevice — see memory.x). Pins are the EN04/EN05 board's nRF GPIO. Diagnostic LED on D9 = P1.14.
 
 #![no_std]
 #![no_main]
@@ -32,11 +32,11 @@ fn led(on: bool) {
     unsafe { core::ptr::write_volatile(reg as *mut u32, 1 << LED_PIN) }
 }
 
-// JD79660 BWRY: 200×200, 2 bits/pixel, 4 px/byte.
-const W: usize = 200;
-const H: usize = 200;
-const ROW_BYTES: usize = W / 4; // 50
-const FB_BYTES: usize = ROW_BYTES * H; // 10000
+// Adafruit 6414 BWRY in chip coordinates: 180 wide × 384 tall, 2 bits/pixel.
+const W: usize = 180;
+const H: usize = 384;
+const ROW_BYTES: usize = W / 4; // 45
+const FB_BYTES: usize = 17_664; // 45×384 = 17,280 data + trailing padding (matches inksurf)
 
 // 2-bit colour codes (JD79660 / inksurf), packed 4/byte.
 const BLACK: u8 = 0b00;
@@ -107,12 +107,19 @@ fn main() -> ! {
         let _ = OutputPin::set_high(cs as &mut _);
     };
 
-    // Init (Seeed Setup517 / JD79660, 200×200 BWRY).
+    // Init (inksurf's proven JD79667 sequence for the Adafruit 6414, 180×384).
     cmd(&mut spi, &mut cs, &mut dc, 0x4D, &[0x78]);
     cmd(&mut spi, &mut cs, &mut dc, 0x00, &[0x0F, 0x29]); // PSR
-    cmd(&mut spi, &mut cs, &mut dc, 0x06, &[0x0D, 0x12, 0x30, 0x20, 0x19, 0x2A, 0x22]); // BTST_P
+    cmd(&mut spi, &mut cs, &mut dc, 0x01, &[0x07, 0x00]); // PWRR
+    cmd(&mut spi, &mut cs, &mut dc, 0x03, &[0x10, 0x54, 0x44]); // POFS
+    cmd(&mut spi, &mut cs, &mut dc, 0x06, &[0x05, 0x00, 0x3F, 0x0A, 0x25, 0x12, 0x1A]); // BTST
     cmd(&mut spi, &mut cs, &mut dc, 0x50, &[0x37]); // CDI
-    cmd(&mut spi, &mut cs, &mut dc, 0x61, &[0x00, 0xC8, 0x00, 0xC8]); // TRES 200×200
+    cmd(&mut spi, &mut cs, &mut dc, 0x60, &[0x02, 0x02]); // TCON
+    cmd(&mut spi, &mut cs, &mut dc, 0x61, &[0x00, 0xB4, 0x01, 0x80]); // TRES 180×384
+    cmd(&mut spi, &mut cs, &mut dc, 0xE7, &[0x1C]);
+    cmd(&mut spi, &mut cs, &mut dc, 0xE3, &[0x22]);
+    cmd(&mut spi, &mut cs, &mut dc, 0xB4, &[0xD0]);
+    cmd(&mut spi, &mut cs, &mut dc, 0xB5, &[0x03]);
     cmd(&mut spi, &mut cs, &mut dc, 0xE9, &[0x01]);
     cmd(&mut spi, &mut cs, &mut dc, 0x30, &[0x08]); // PLL
     cmd(&mut spi, &mut cs, &mut dc, 0x04, &[]); // POWER ON
