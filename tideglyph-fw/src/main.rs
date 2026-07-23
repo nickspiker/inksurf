@@ -130,7 +130,6 @@ fn main() -> ! {
     cmd(&mut spi, &mut cs, &mut dc, 0x44, &[0x00, (W / 8 - 1) as u8]); // RAM X window
     cmd(&mut spi, &mut cs, &mut dc, 0x45, &[0x00, 0x00, (H as u16 - 1) as u8, ((H as u16 - 1) >> 8) as u8]); // RAM Y window
     cmd(&mut spi, &mut cs, &mut dc, 0x3C, &[0x05]); // border = white
-    cmd(&mut spi, &mut cs, &mut dc, 0x21, &[0x00, 0x80]); // display update control 1 (from inksurf's proven SSD1680 init)
     cmd(&mut spi, &mut cs, &mut dc, 0x18, &[0x80]); // temperature sensor
     cmd(&mut spi, &mut cs, &mut dc, 0x4E, &[0x00]); // RAM X address counter
     cmd(&mut spi, &mut cs, &mut dc, 0x4F, &[0x00, 0x00]); // RAM Y address counter
