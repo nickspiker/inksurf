@@ -56,6 +56,9 @@ fn main() -> ! {
         0,
     );
 
+    // Red diagnostic LED (P0.26 — the one that visibly blinked 2 Hz in the first blink test). Blinked 3× at the top of each loop iteration so we can tell if the SPI sequence is actually executing each cycle.
+    let mut led = port0.p0_26.into_push_pull_output(Level::High).degrade();
+
     // Control pins on the EN04/EN05 board: CS=D7=P1.12, DC=D16=P0.31, RST=D11=P0.15, BUSY=D3=P0.29, panel power-enable EN=D6=P1.11 (driven HIGH).
     let mut panel_en = port1.p1_11.into_push_pull_output(Level::Low).degrade();
     let mut cs = port1.p1_12.into_push_pull_output(Level::High).degrade();
@@ -102,6 +105,13 @@ fn main() -> ! {
     let fb = unsafe { &mut *core::ptr::addr_of_mut!(FB) };
     let mut fill: u8 = 0x00;
     loop {
+        // 3 quick red blinks: proof the loop (SPI sequence) is executing.
+        for _ in 0..3 {
+            let _ = led.set_low();
+            delay_ms(120);
+            let _ = led.set_high();
+            delay_ms(120);
+        }
         for b in fb.iter_mut() {
             *b = fill;
         }
