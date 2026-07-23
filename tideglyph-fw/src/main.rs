@@ -60,6 +60,13 @@ fn main() -> ! {
     let port0 = p0::Parts::new(p.P0);
     let port1 = p1::Parts::new(p.P1);
 
+    // Diagnostic LED (red, P0.26, active-low): solid ON while the panel sequence
+    // runs; a slow heartbeat once it completes. Solid-and-never-heartbeats means
+    // stuck (a BUSY wait maxed out or a panic); heartbeat means every SPI write
+    // + refresh finished. This is our signal independent of the panel itself.
+    let mut led = port0.p0_26.into_push_pull_output(Level::High).degrade();
+    let _ = led.set_low(); // ON
+
     // SPI pins: SCLK=P1.13 (D8), MOSI=P1.15 (D10). Panel is write-only (no MISO).
     let sck = port1.p1_13.into_push_pull_output(Level::Low).degrade();
     let mosi = port1.p1_15.into_push_pull_output(Level::Low).degrade();
@@ -149,8 +156,12 @@ fn main() -> ! {
 
     cmd(&mut spi, &mut cs, &mut dc, 0x02, &[]); // POWER OFF
 
-    // Frame is latched into the e-ink; nothing more to do.
+    // Completed the full sequence — heartbeat the LED so we can tell "ran to the
+    // end" apart from "stuck mid-init".
     loop {
-        cpu_delay(64_000_000);
+        let _ = led.set_low();
+        delay_ms(150);
+        let _ = led.set_high();
+        delay_ms(850);
     }
 }
