@@ -40,13 +40,16 @@ static HEAP: embedded_alloc::LlffHeap = embedded_alloc::LlffHeap::empty();
 const HEAP_SIZE: usize = 16 * 1024;
 static mut HEAP_MEM: [u8; HEAP_SIZE] = [0; HEAP_SIZE];
 
+/// This build's Eagle-time stamp — the downgrade FLOOR (see build.rs). An OTA
+/// manifest is accepted only if its stamp strictly exceeds this.
+include!(concat!(env!("OUT_DIR"), "/build_stamp.rs"));
+
 /// 256-bit shared secret for the OTA keyed-BLAKE3 MAC. Held on BOTH the device
-/// (here) and the host signer (tideglyph-push). Whoever holds it can author
-/// updates; whoever doesn't, can't forge one. Placeholder zeros until the real
-/// key is generated host-side. KEEP IT SECRET; recovery from a bad push is a
-/// USB double-tap reflash.
+/// (baked from ../ota_key.bin, gitignored) and the host signer (tideglyph-push).
+/// Whoever holds it can author updates; whoever doesn't, can't forge one. KEEP
+/// IT SECRET; recovery from a bad push is a USB double-tap reflash.
 #[allow(dead_code)] // wired into COMMIT in the OTA-protocol step
-const OTA_KEY: [u8; 32] = [0u8; 32];
+const OTA_KEY: [u8; 32] = *include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/../ota_key.bin"));
 /// Domain separation — bound into the MAC so this key can't be replayed cross-protocol.
 const OTA_DOMAIN: &[u8] = b"tideglyph-ota-v1";
 

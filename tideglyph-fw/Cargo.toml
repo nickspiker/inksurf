@@ -43,6 +43,10 @@ embassy-embedded-hal = { version = "0.6", default-features = false }
 vsf = { path = "../../vsf", default-features = false }
 embedded-alloc = "0.6"
 
+# build.rs computes the Eagle-time build-stamp floor via vsf (std, host-side).
+[build-dependencies]
+vsf = { path = "../../vsf" }
+
 [patch.crates-io]
 nrf-sdc = { git = "https://github.com/alexmoon/nrf-sdc.git", rev = "abe49d22ebfc85fae134eb082fbfddf752016a55" }
 nrf-mpsl = { git = "https://github.com/alexmoon/nrf-sdc.git", rev = "abe49d22ebfc85fae134eb082fbfddf752016a55" }
