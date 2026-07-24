@@ -126,25 +126,50 @@ async fn cmd_push(image_path: &str) -> Result<()> {
     begin.extend_from_slice(&(manifest.len() as u16).to_le_bytes());
     dev.write(&ctrl, &begin, WriteType::WithResponse).await?;
 
-    // stream image, then manifest, over the one data characteristic
+    // Stream the IMAGE with write-without-response (fast) but flow-controlled:
+    // never let the device fall more than WINDOW bytes behind us (read its
+    // `received` counter as backpressure). Bounded in-flight -> BlueZ doesn't
+    // drop, and the fast path stays fast. The tiny manifest goes WithResponse.
+    let read_received = |s: &[u8]| -> usize {
+        if s.len() >= 6 { u32::from_le_bytes(s[2..6].try_into().unwrap()) as usize } else { 0 }
+    };
+    const WINDOW: usize = 8192;
     let t0 = std::time::Instant::now();
     let mut sent = 0usize;
-    let total = image.len() + manifest.len();
-    for byte_stream in [image.as_slice(), manifest.as_slice()] {
-        for chunk in byte_stream.chunks(CHUNK) {
-            // WithResponse: each write is acked before the next, so nothing is
-            // dropped and COMMIT can't overtake the data (write-without-response
-            // gets buffered + lost on BlueZ with no flow control).
-            dev.write(&data, chunk, WriteType::WithResponse).await?;
-            sent += chunk.len();
-            if sent % (CHUNK * 40) < CHUNK {
-                print!("\r  {sent}/{total} bytes ({:.0} B/s)", sent as f64 / t0.elapsed().as_secs_f64());
-                use std::io::Write;
-                std::io::stdout().flush().ok();
+    for chunk in image.chunks(CHUNK) {
+        dev.write(&data, chunk, WriteType::WithoutResponse).await?;
+        sent += chunk.len();
+        if sent % 4096 < CHUNK {
+            // backpressure: wait until the device is within WINDOW of us
+            loop {
+                let recv = read_received(&dev.read(&status).await?);
+                if sent.saturating_sub(recv) <= WINDOW {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(2)).await;
             }
+            print!("\r  {sent}/{} image bytes ({:.0} B/s)", image.len(), sent as f64 / t0.elapsed().as_secs_f64());
+            use std::io::Write;
+            std::io::stdout().flush().ok();
         }
     }
-    println!("\r  {sent}/{total} bytes in {:.1}s ({:.0} B/s)      ", t0.elapsed().as_secs_f64(), sent as f64 / t0.elapsed().as_secs_f64());
+    // ensure every image byte actually landed (WNR could otherwise silently drop)
+    let mut ok = false;
+    for _ in 0..200 {
+        if read_received(&dev.read(&status).await?) >= image.len() {
+            ok = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    if !ok {
+        return Err(anyhow!("device did not receive the full image (WNR drop) — retry or use reliable mode"));
+    }
+    println!("\r  {} image bytes in {:.1}s ({:.0} B/s)      ", image.len(), t0.elapsed().as_secs_f64(), image.len() as f64 / t0.elapsed().as_secs_f64());
+    // manifest reliably (small)
+    for chunk in manifest.chunks(CHUNK) {
+        dev.write(&data, chunk, WriteType::WithResponse).await?;
+    }
 
     // COMMIT → device replies fast (status=verifying) then verifies; tolerate the
     // write result and poll status for the real verdict.
