@@ -121,6 +121,23 @@ const OUTSET: u32 = P1_BASE + 0x508;
 const OUTCLR: u32 = P1_BASE + 0x50C;
 const LED: u32 = 14;
 
+// Park the XIAO onboard RGB user LED (P0.26 R, P0.30 G, P0.06 B — active LOW) fully
+// OFF: drive each HIGH via direct registers so it persists without a HAL pin object
+// to drop (a dropped Output reverts to input, and we never touch these in the HAL).
+// HIGH not LOW — LOW is the ON state for an active-low LED. OUTSET before DIRSET so
+// the pin latches high the instant it becomes an output (never a low glitch = glow).
+// Insurance against any onboard LED being the dim-green the user saw; the battery
+// charge LED is on the BQ25101, not a GPIO, so this can't affect that one.
+fn park_rgb_leds() {
+    const P0_BASE: u32 = 0x5000_0000;
+    for pin in [26u32, 30, 6] {
+        unsafe {
+            core::ptr::write_volatile((P0_BASE + 0x508) as *mut u32, 1 << pin); // OUTSET = high
+            core::ptr::write_volatile((P0_BASE + 0x700 + pin * 4) as *mut u32, 1 | (1 << 1)); // DIR=out, input disconnect
+        }
+    }
+}
+
 // D9 diagnostic LED ditched (user request) — the panel is the real feedback now,
 // and leaving the pin as a floating input draws no current. led_init/led/stage
 // are kept as no-ops (still called for boot pacing) so the call sites stay put.
@@ -388,6 +405,50 @@ fn sun_altitude_deg(unix: i64) -> f64 {
         / core::f64::consts::PI
 }
 
+/// Moon altitude (degrees) at `unix` from SUN_LAT/LON — Meeus low-precision lunar
+/// theory straight from the Unix instant. `> 0` = moon up. Same ecliptic→horizontal
+/// pipeline as the sun, plus the dominant lunar periodic terms. Cross-checked
+/// against tide-display's reference to < 1e-13°.
+fn moon_altitude_deg(unix: i64) -> f64 {
+    const J2000_UNIX: f64 = 946_728_000.0;
+    let d = (unix as f64 - J2000_UNIX) / 86_400.0;
+    let rad = |x: f64| x * core::f64::consts::PI / 180.0;
+    let norm = |x: f64| {
+        let m = libm::fmod(x, 360.0);
+        if m < 0.0 {
+            m + 360.0
+        } else {
+            m
+        }
+    };
+    let lp = norm(218.316 + 13.176396 * d); // mean longitude
+    let m = norm(134.963 + 13.064993 * d); // mean anomaly
+    let f = norm(93.272 + 13.229350 * d); // argument of latitude
+    let dd = norm(297.850 + 12.190749 * d); // mean elongation
+    let lambda = lp + 6.289 * libm::sin(rad(m)) - 1.274 * libm::sin(rad(2.0 * (lp - dd) - m))
+        + 0.658 * libm::sin(rad(2.0 * (lp - dd)))
+        - 0.186 * libm::sin(rad(norm(357.529 + 0.985600 * d)));
+    let beta =
+        5.128 * libm::sin(rad(f)) + 0.281 * libm::sin(rad(m + f)) - 0.278 * libm::sin(rad(f - m));
+    let eps = rad(23.439 - 0.0000004 * d);
+    let lam = rad(lambda);
+    let bet = rad(beta);
+    let ra = libm::atan2(
+        libm::sin(lam) * libm::cos(eps) - libm::tan(bet) * libm::sin(eps),
+        libm::cos(lam),
+    );
+    let dec = libm::asin(
+        libm::sin(bet) * libm::cos(eps) + libm::cos(bet) * libm::sin(eps) * libm::sin(lam),
+    );
+    let gmst = norm(280.46061837 + 360.98564736629 * d);
+    let lst = rad(norm(gmst + SUN_LON));
+    let ha = lst - ra;
+    let lat = rad(SUN_LAT);
+    libm::asin(libm::sin(lat) * libm::sin(dec) + libm::cos(lat) * libm::cos(dec) * libm::cos(ha))
+        * 180.0
+        / core::f64::consts::PI
+}
+
 /// Day→night colour swap (BLACK↔WHITE, YELLOW↔RED).
 fn invert_code(c: u8) -> u8 {
     match c {
@@ -519,6 +580,20 @@ async fn render_tide(unix: i64, batt_mv: u16) {
             }
         }
     }
+    // Moon-visibility line: one pixel per column riding the top row when the moon
+    // is up at that column's time, the bottom row when it's down — the square-wave
+    // jumps land at moonrise/moonset. Inverts like the now-line so it reads against
+    // whatever day/night background is beneath it (recolors an hour tick rather than
+    // vanishing, since invert_code is an involution).
+    for x in 0..CW {
+        if x % 48 == 0 {
+            embassy_futures::yield_now().await;
+        }
+        let secs = ((x as f32 - CW as f32 / 2.0) / CW as f32 * 86400.0) as i64;
+        let y = if moon_altitude_deg(unix + secs) > 0.0 { 0 } else { CH - 1 };
+        let i = y * CW + x;
+        canvas[i] = invert_code(canvas[i]);
+    }
     pack(canvas);
 }
 
@@ -601,6 +676,7 @@ async fn main(spawner: Spawner) {
     unsafe { HEAP.init(core::ptr::addr_of_mut!(HEAP_MEM) as usize, HEAP_SIZE) }
 
     let p = embassy_nrf::init(Default::default());
+    park_rgb_leds(); // force onboard RGB LED off (drive high) — see fn comment
     led_init();
 
     // Inherit + pet the bootloader's watchdog (N=1 handle, matching WatchdogFlash).
