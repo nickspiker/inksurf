@@ -15,7 +15,7 @@ use defmt::{info, unwrap};
 use embassy_boot::{AlignedBuffer, FirmwareUpdater, FirmwareUpdaterConfig, State};
 use embassy_embedded_hal::adapter::BlockingAsync;
 use embassy_executor::Spawner;
-use embassy_futures::join::join;
+use embassy_futures::join::join3;
 use embassy_nrf::mode::Async;
 use embassy_nrf::gpio::{Input, Level, Output, OutputDrive, Pull};
 use embassy_nrf::nvmc::Nvmc;
@@ -239,9 +239,10 @@ struct OtaService {
     data: [u8; 244],
     #[characteristic(uuid = "b5f90004-2d5a-4f3c-9b1a-1d2e3f405060", read, value = [0u8; 6])]
     status: [u8; 6],
-    /// Battery: [mV u16 LE, raw u16 LE] — last SAADC read.
-    #[characteristic(uuid = "b5f90005-2d5a-4f3c-9b1a-1d2e3f405060", read, value = [0u8; 4])]
-    battery: [u8; 4],
+    /// Battery + liveness: [mV u16 LE, raw u16 LE, refresh_count u16 LE]. The
+    /// count increments every refresh, so a reader can confirm the clock is ticking.
+    #[characteristic(uuid = "b5f90005-2d5a-4f3c-9b1a-1d2e3f405060", read, value = [0u8; 6])]
+    battery: [u8; 6],
 }
 
 const V_RECEIVING: u8 = 1;
@@ -448,6 +449,60 @@ fn pack(canvas: &[u8; CW * CH]) {
     }
 }
 
+/// Refresh cadence. 10 min = the design point for battery life.
+const REFRESH_SECS: u64 = 600;
+
+/// The peripherals a refresh cycle needs. Held as masters; each cycle clones them
+/// (clone_unchecked) and uses them strictly sequentially (battery read fully done
+/// before the panel is built), so no two live handles ever touch the same pin.
+struct PanelHw {
+    saadc: embassy_nrf::Peri<'static, SAADC>,
+    ain: embassy_nrf::Peri<'static, embassy_nrf::peripherals::P0_31>,
+    ven: embassy_nrf::Peri<'static, embassy_nrf::peripherals::P0_14>,
+    spi: embassy_nrf::Peri<'static, TWISPI0>,
+    sck: embassy_nrf::Peri<'static, embassy_nrf::peripherals::P1_13>,
+    mosi: embassy_nrf::Peri<'static, embassy_nrf::peripherals::P1_15>,
+    cs: embassy_nrf::Peri<'static, embassy_nrf::peripherals::P1_12>,
+    rst: embassy_nrf::Peri<'static, embassy_nrf::peripherals::P0_15>,
+    busy: embassy_nrf::Peri<'static, embassy_nrf::peripherals::P0_29>,
+    en: embassy_nrf::Peri<'static, embassy_nrf::peripherals::P1_11>,
+}
+
+/// One full refresh: read the battery (P0.31/AIN7), render the chart for `now`,
+/// then drive the panel (P0.31 reused as DC — sequential, so sound) and power it
+/// off. Returns the battery reading. This is BOTH the boot self-test and the loop
+/// body — if it survives the self-test, the loop can't crash.
+async fn do_refresh(hw: &PanelHw, now: i64) -> (u16, u16) {
+    let batt = read_battery(
+        unsafe { hw.saadc.clone_unchecked() },
+        unsafe { hw.ain.clone_unchecked() },
+        unsafe { hw.ven.clone_unchecked() },
+    )
+    .await;
+    let mut sc = spim::Config::default();
+    sc.frequency = spim::Frequency::M8;
+    let spi = Spim::new_txonly(
+        unsafe { hw.spi.clone_unchecked() },
+        Irqs,
+        unsafe { hw.sck.clone_unchecked() },
+        unsafe { hw.mosi.clone_unchecked() },
+        sc,
+    );
+    let mut panel = Panel {
+        spi,
+        cs: Output::new(unsafe { hw.cs.clone_unchecked() }, Level::High, OutputDrive::Standard),
+        dc: Output::new(unsafe { hw.ain.clone_unchecked() }, Level::Low, OutputDrive::Standard),
+        rst: Output::new(unsafe { hw.rst.clone_unchecked() }, Level::High, OutputDrive::Standard),
+        busy: Input::new(unsafe { hw.busy.clone_unchecked() }, Pull::None),
+        en: Output::new(unsafe { hw.en.clone_unchecked() }, Level::Low, OutputDrive::Standard),
+    };
+    render_tide(now, batt.0).await;
+    panel.init().await;
+    let fb = unsafe { &*core::ptr::addr_of!(PANEL_FB) };
+    panel.push(fb).await;
+    batt
+}
+
 #[embassy_executor::main]
 async fn main(spawner: Spawner) {
     unsafe { HEAP.init(core::ptr::addr_of_mut!(HEAP_MEM) as usize, HEAP_SIZE) }
@@ -518,44 +573,29 @@ async fn main(spawner: Spawner) {
     };
     stage(3).await; // SDC built
 
-    // Read the battery via the onboard divider (P0.31/AIN7 + P0.14 gate) BEFORE
-    // driving the panel — the user's trick: any disturbance the divider puts on the
-    // shared P0.31 DC net gets repainted over immediately. Clone P0.31 so it can be
-    // reused as panel DC once the SAADC read is done (strictly sequential use).
-    let dc_pin = unsafe { p.P0_31.clone_unchecked() };
-    let batt = read_battery(p.SAADC, p.P0_31, p.P0_14).await;
-    info!("[batt] {} mV (raw {})", batt.0, batt.1);
-
     // OTA flash: the app's own Nvmc behind a Mutex, shared with per-connection
     // FirmwareUpdaters. from_linkerfile reads the __bootloader_dfu/state symbols.
     let nvmc = Mutex::<NoopRawMutex, _>::new(BlockingAsync::new(Nvmc::new(p.NVMC)));
 
-    // Drive the panel: render the tide chart + refresh (embassy-nrf SPIM port of
-    // the proven JD79667 driver). The render yields and the ~15s refresh is async,
-    // so the WDT-pet task keeps running. mark_booted is DELIBERATELY after this so
-    // a bad render/panel that hangs never confirms -> WDT -> bootloader reverts.
-    {
-        let mut sc = spim::Config::default();
-        sc.frequency = spim::Frequency::M8;
-        let spi = Spim::new_txonly(p.TWISPI0, Irqs, p.P1_13, p.P1_15, sc);
-        let mut panel = Panel {
-            spi,
-            cs: Output::new(p.P1_12, Level::High, OutputDrive::Standard),
-            dc: Output::new(dc_pin, Level::Low, OutputDrive::Standard),
-            rst: Output::new(p.P0_15, Level::High, OutputDrive::Standard),
-            busy: Input::new(p.P0_29, Pull::None),
-            en: Output::new(p.P1_11, Level::Low, OutputDrive::Standard),
-        };
-        render_tide(BUILD_UNIX_SECS, batt.0).await; // fills PANEL_FB with the tide chart
-        panel.init().await;
-        let fb = unsafe { &*core::ptr::addr_of!(PANEL_FB) };
-        panel.push(fb).await;
-        info!("[panel] tide chart refreshed for unix {}", BUILD_UNIX_SECS);
-    }
+    // Hold the battery + panel peripherals as masters; do_refresh clones them each
+    // cycle. The FIRST refresh is the boot self-test (battery -> render -> panel).
+    // If it hangs/crashes, mark_booted below is never reached -> WDT -> auto-revert.
+    let hw = PanelHw {
+        saadc: p.SAADC,
+        ain: p.P0_31,
+        ven: p.P0_14,
+        spi: p.TWISPI0,
+        sck: p.P1_13,
+        mosi: p.P1_15,
+        cs: p.P1_12,
+        rst: p.P0_15,
+        busy: p.P0_29,
+        en: p.P1_11,
+    };
+    let batt = do_refresh(&hw, BUILD_UNIX_SECS).await;
+    info!("[boot] self-test refresh OK, batt {} mV", batt.0);
 
-    // Confirm the boot ONLY after a successful render + panel drive (the self-test).
-    // A bad render/panel that hangs never reaches here -> WDT -> bootloader reverts
-    // to the previous good image, no cable needed.
+    // Confirm the boot ONLY after the self-test refresh succeeded.
     {
         let mut aligned = AlignedBuffer([0u8; 4]);
         let cfg = FirmwareUpdaterConfig::from_linkerfile(&nvmc, &nvmc);
@@ -566,10 +606,10 @@ async fn main(spawner: Spawner) {
         let _ = updater.mark_booted().await;
     }
 
-    run(sdc, &nvmc, batt).await;
+    run(sdc, &nvmc, &hw, batt).await;
 }
 
-async fn run<C, F>(controller: C, nvmc: &Mutex<NoopRawMutex, F>, batt: (u16, u16))
+async fn run<C, F>(controller: C, nvmc: &Mutex<NoopRawMutex, F>, hw: &PanelHw, batt: (u16, u16))
 where
     C: Controller,
     F: embedded_storage_async::nor_flash::NorFlash,
@@ -588,37 +628,48 @@ where
         appearance: &appearance::power_device::GENERIC_POWER_DEVICE,
     })));
 
-    // Publish the boot-time battery reading: [mV u16 LE, raw u16 LE].
-    let mut bch = [0u8; 4];
-    bch[0..2].copy_from_slice(&batt.0.to_le_bytes());
-    bch[2..4].copy_from_slice(&batt.1.to_le_bytes());
-    let _ = server.set(&server.ota.battery, &bch);
+    let set_batt = |b: (u16, u16), count: u16| {
+        let mut bch = [0u8; 6];
+        bch[0..2].copy_from_slice(&b.0.to_le_bytes());
+        bch[2..4].copy_from_slice(&b.1.to_le_bytes());
+        bch[4..6].copy_from_slice(&count.to_le_bytes());
+        let _ = server.set(&server.ota.battery, &bch);
+    };
+    set_batt(batt, 0);
 
-    let _ = join(ble_task(runner), async {
-        loop {
-            led(false); // advertising: LED off
-            match advertise(ADV_NAME, &mut peripheral, &server).await {
-                Ok(conn) => {
-                    led(true); // connected: LED on
-                    // Fresh updater per connection: write_firmware's last-erased
-                    // tracking resets, so a new push always erases sector 0 before
-                    // writing (stale tracking across pushes would corrupt DFU).
-                    let mut aligned = AlignedBuffer([0u8; 4]);
-                    let cfg = FirmwareUpdaterConfig::from_linkerfile(nvmc, nvmc);
-                    let mut updater = FirmwareUpdater::new(cfg, &mut aligned.0);
-                    ota_session(&server, &conn, &mut updater).await;
-                }
-                Err(_) => {
-                    for _ in 0..3 {
-                        led(true);
-                        Timer::after(Duration::from_millis(60)).await;
-                        led(false);
-                        Timer::after(Duration::from_millis(60)).await;
+    let _ = join3(
+        ble_task(runner),
+        // Advertise + serve OTA, forever.
+        async {
+            loop {
+                match advertise(ADV_NAME, &mut peripheral, &server).await {
+                    Ok(conn) => {
+                        // Fresh updater per connection so write_firmware's last-erased
+                        // tracking resets (stale tracking across pushes corrupts DFU).
+                        let mut aligned = AlignedBuffer([0u8; 4]);
+                        let cfg = FirmwareUpdaterConfig::from_linkerfile(nvmc, nvmc);
+                        let mut updater = FirmwareUpdater::new(cfg, &mut aligned.0);
+                        ota_session(&server, &conn, &mut updater).await;
                     }
+                    Err(_) => Timer::after(Duration::from_millis(500)).await,
                 }
             }
-        }
-    })
+        },
+        // The CLOCK: refresh the panel every REFRESH_SECS for the current time.
+        // do_refresh here is identical to the boot self-test, so it can't crash if
+        // the self-test passed. Reads the battery each cycle (the before-refresh
+        // idea) and bumps the count so a BLE reader can see it ticking.
+        async {
+            let mut count = 0u16;
+            loop {
+                Timer::after(Duration::from_secs(REFRESH_SECS)).await;
+                let now = BUILD_UNIX_SECS + embassy_time::Instant::now().as_secs() as i64;
+                let b = do_refresh(hw, now).await;
+                count = count.wrapping_add(1);
+                set_batt(b, count);
+            }
+        },
+    )
     .await;
 }
 

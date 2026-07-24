@@ -100,11 +100,15 @@ async fn cmd_battery() -> Result<()> {
     let ch = dev.characteristics().into_iter().find(|c| c.uuid == BATTERY).context("no battery char")?;
     let v = dev.read(&ch).await?;
     dev.disconnect().await.ok();
-    if v.len() >= 4 {
+    if v.len() >= 6 {
+        let mv = u16::from_le_bytes([v[0], v[1]]);
+        let raw = u16::from_le_bytes([v[2], v[3]]);
+        let count = u16::from_le_bytes([v[4], v[5]]);
+        println!("battery: {mv} mV  (raw {raw})  refresh_count {count}");
+    } else if v.len() >= 4 {
         let mv = u16::from_le_bytes([v[0], v[1]]);
         let raw = u16::from_le_bytes([v[2], v[3]]);
         println!("battery: {mv} mV  (raw {raw})");
-        println!("  to calibrate at a known voltage V_mV: set BATT_CAL_NUM=V_mV, BATT_CAL_DEN={raw}");
     } else {
         println!("battery char returned {} bytes: {v:?}", v.len());
     }
