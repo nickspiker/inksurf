@@ -18,7 +18,8 @@ use embassy_executor::Spawner;
 use embassy_futures::join::join;
 use embassy_nrf::mode::Async;
 use embassy_nrf::nvmc::Nvmc;
-use embassy_nrf::peripherals::RNG;
+use embassy_nrf::peripherals::{RNG, SAADC};
+use embassy_nrf::saadc::{self, Saadc};
 use embassy_nrf::wdt::{self, Watchdog, WatchdogHandle};
 use embassy_nrf::{bind_interrupts, rng};
 use embassy_sync::blocking_mutex::raw::NoopRawMutex;
@@ -143,12 +144,20 @@ unsafe fn pre_init() {
 
 bind_interrupts!(struct Irqs {
     RNG => rng::InterruptHandler<RNG>;
+    SAADC => saadc::InterruptHandler;
     EGU0_SWI0 => nrf_sdc::mpsl::LowPrioInterruptHandler;
     CLOCK_POWER => nrf_sdc::mpsl::ClockInterruptHandler;
     RADIO => nrf_sdc::mpsl::HighPrioInterruptHandler;
     TIMER0 => nrf_sdc::mpsl::HighPrioInterruptHandler;
     RTC0 => nrf_sdc::mpsl::HighPrioInterruptHandler;
 });
+
+// Battery-voltage calibration. Divider is 1M/2M (÷1.5) on AIN0/P0.02, read at
+// 0.6V ref + 1/6 gain (3.6V full-scale) 12-bit. Nominal: batt_mV = raw * 5400/4096
+// (raw≈3185 at 4.20V). Refined from the real reading at a known 4.20V: set
+// BATT_CAL_NUM = 4200, BATT_CAL_DEN = <raw measured at 4.20V>.
+const BATT_CAL_NUM: u32 = 5400;
+const BATT_CAL_DEN: u32 = 4096;
 
 #[embassy_executor::task]
 async fn mpsl_task(mpsl: &'static MultiprotocolServiceLayer<'static>) -> ! {
@@ -179,6 +188,30 @@ fn build_sdc<'d, const N: usize>(
         .build(p, rng, mpsl, mem)
 }
 
+/// One battery read via the SAADC on AIN0 (P0.02): 0.6V ref + 1/6 gain (3.6V
+/// full-scale) + 40µs acquisition (high-Z divider), 16x averaged. Returns
+/// (millivolts, raw 12-bit count).
+async fn read_battery(
+    saadc_dev: embassy_nrf::Peri<'static, SAADC>,
+    ain0: embassy_nrf::Peri<'static, embassy_nrf::peripherals::P0_02>,
+) -> (u16, u16) {
+    let mut cc = saadc::ChannelConfig::single_ended(ain0);
+    cc.gain = saadc::Gain::Gain1_6;
+    cc.reference = saadc::Reference::Internal;
+    cc.time = saadc::Time::_40US;
+    let mut adc = Saadc::new(saadc_dev, Irqs, saadc::Config::default(), [cc]);
+    let mut buf = [0i16; 1];
+    adc.sample(&mut buf).await; // discard first (settling)
+    let mut acc = 0i32;
+    for _ in 0..16 {
+        adc.sample(&mut buf).await;
+        acc += buf[0] as i32;
+    }
+    let raw = (acc / 16).clamp(0, 4095) as u16;
+    let mv = (raw as u32 * BATT_CAL_NUM / BATT_CAL_DEN) as u16;
+    (mv, raw)
+}
+
 // GATT server: OTA service.
 //   ctrl   BEGIN [0x01, image_len u32 LE, manifest_len u16 LE]; COMMIT [0x02]
 //   data   image bytes (image_len) then manifest bytes (manifest_len)
@@ -198,6 +231,9 @@ struct OtaService {
     data: [u8; 244],
     #[characteristic(uuid = "b5f90004-2d5a-4f3c-9b1a-1d2e3f405060", read, value = [0u8; 6])]
     status: [u8; 6],
+    /// Battery: [mV u16 LE, raw u16 LE] — last SAADC read.
+    #[characteristic(uuid = "b5f90005-2d5a-4f3c-9b1a-1d2e3f405060", read, value = [0u8; 4])]
+    battery: [u8; 4],
 }
 
 const V_RECEIVING: u8 = 1;
@@ -277,6 +313,10 @@ async fn main(spawner: Spawner) {
     };
     stage(3).await; // SDC built
 
+    // Battery: one SAADC read on AIN0 (P0.02) through the ÷1.5 divider.
+    let batt = read_battery(p.SAADC, p.P0_02).await;
+    info!("[batt] {} mV (raw {})", batt.0, batt.1);
+
     // OTA flash: the app's own Nvmc behind a Mutex, shared with per-connection
     // FirmwareUpdaters. from_linkerfile reads the __bootloader_dfu/state symbols.
     let nvmc = Mutex::<NoopRawMutex, _>::new(BlockingAsync::new(Nvmc::new(p.NVMC)));
@@ -295,10 +335,10 @@ async fn main(spawner: Spawner) {
         let _ = updater.mark_booted().await;
     }
 
-    run(sdc, &nvmc).await;
+    run(sdc, &nvmc, batt).await;
 }
 
-async fn run<C, F>(controller: C, nvmc: &Mutex<NoopRawMutex, F>)
+async fn run<C, F>(controller: C, nvmc: &Mutex<NoopRawMutex, F>, batt: (u16, u16))
 where
     C: Controller,
     F: embedded_storage_async::nor_flash::NorFlash,
@@ -316,6 +356,12 @@ where
         name: ADV_NAME,
         appearance: &appearance::power_device::GENERIC_POWER_DEVICE,
     })));
+
+    // Publish the boot-time battery reading: [mV u16 LE, raw u16 LE].
+    let mut bch = [0u8; 4];
+    bch[0..2].copy_from_slice(&batt.0.to_le_bytes());
+    bch[2..4].copy_from_slice(&batt.1.to_le_bytes());
+    let _ = server.set(&server.ota.battery, &bch);
 
     let _ = join(ble_task(runner), async {
         loop {
