@@ -46,6 +46,7 @@ embedded-alloc = "0.6"
 
 # On-device tide prediction (no_std, libm-only). Same crate the Pi build validates.
 tide-core = { path = "../tide-core" }
+libm = "0.2" # solar-altitude trig for the day/night invert
 
 # build.rs computes the Eagle-time build-stamp floor via vsf (std, host-side).
 [build-dependencies]

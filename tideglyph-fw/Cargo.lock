@@ -1576,6 +1576,7 @@ dependencies = [
  "embedded-alloc",
  "embedded-storage-async",
  "futures",
+ "libm",
  "nrf-mpsl",
  "nrf-sdc",
  "panic-probe",

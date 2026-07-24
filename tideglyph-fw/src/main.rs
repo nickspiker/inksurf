@@ -353,6 +353,52 @@ const N_SAMPLES: usize = 241; // ±12h at 6-min steps
 // fills it white before drawing, so the initial value doesn't matter.
 static mut CANVAS: [u8; CW * CH] = [0u8; CW * CH];
 
+// Bremerton (Southworth WA) for the solar day/night calc.
+const SUN_LAT: f64 = 47.5126;
+const SUN_LON: f64 = -122.5054;
+
+/// Sun altitude (degrees) at `unix`, seen from SUN_LAT/LON. Meeus low-precision
+/// solar position straight from the Unix instant (no dates/timezones), same
+/// ecliptic→horizontal pipeline as the moon calc. `> 0` = sun up. Host-verified:
+/// +58° summer noon, −20° midnight, +21° winter noon.
+fn sun_altitude_deg(unix: i64) -> f64 {
+    const J2000_UNIX: f64 = 946_728_000.0;
+    let d = (unix as f64 - J2000_UNIX) / 86_400.0;
+    let rad = |x: f64| x * core::f64::consts::PI / 180.0;
+    let norm = |x: f64| {
+        let m = libm::fmod(x, 360.0);
+        if m < 0.0 {
+            m + 360.0
+        } else {
+            m
+        }
+    };
+    let l = norm(280.460 + 0.9856474 * d);
+    let g = norm(357.528 + 0.9856003 * d);
+    let lam = rad(l + 1.915 * libm::sin(rad(g)) + 0.020 * libm::sin(rad(2.0 * g)));
+    let eps = rad(23.439 - 0.0000004 * d);
+    let ra = libm::atan2(libm::cos(eps) * libm::sin(lam), libm::cos(lam));
+    let dec = libm::asin(libm::sin(eps) * libm::sin(lam));
+    let gmst = norm(280.46061837 + 360.98564736629 * d);
+    let lst = rad(norm(gmst + SUN_LON));
+    let ha = lst - ra;
+    let lat = rad(SUN_LAT);
+    libm::asin(libm::sin(lat) * libm::sin(dec) + libm::cos(lat) * libm::cos(dec) * libm::cos(ha))
+        * 180.0
+        / core::f64::consts::PI
+}
+
+/// Day→night colour swap (BLACK↔WHITE, YELLOW↔RED).
+fn invert_code(c: u8) -> u8 {
+    match c {
+        C_BLACK => C_WHITE,
+        C_WHITE => C_BLACK,
+        C_YELLOW => C_RED,
+        C_RED => C_YELLOW,
+        _ => c,
+    }
+}
+
 fn interp(s: &[f32; N_SAMPLES], si: f32) -> f32 {
     if si <= 0.0 {
         return s[0];
@@ -424,6 +470,21 @@ async fn render_tide(unix: i64, batt_mv: u16) {
     for y in 3..6 {
         for x in 3..3 + level {
             canvas[y * CW + x] = C_BLACK;
+        }
+    }
+    // Day/night: invert every column where the sun is below the horizon, so the
+    // whole night theme falls out of one pass. Yield periodically (many f64 trig
+    // calls) so the WDT-pet task keeps running.
+    for x in 0..CW {
+        if x % 48 == 0 {
+            embassy_futures::yield_now().await;
+        }
+        let secs = ((x as f32 - CW as f32 / 2.0) / CW as f32 * 86400.0) as i64;
+        if sun_altitude_deg(unix + secs) < 0.0 {
+            for y in 0..CH {
+                let i = y * CW + x;
+                canvas[i] = invert_code(canvas[i]);
+            }
         }
     }
     pack(canvas);
