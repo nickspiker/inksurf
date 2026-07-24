@@ -277,31 +277,31 @@ async fn main(spawner: Spawner) {
     };
     stage(3).await; // SDC built
 
-    // OTA updater over the app's own Nvmc — created here and kept live for the
-    // whole session so the GATT handler can stream into DFU + swap. from_linkerfile
-    // reads the __bootloader_dfu/state symbols (memory.x).
+    // OTA flash: the app's own Nvmc behind a Mutex, shared with per-connection
+    // FirmwareUpdaters. from_linkerfile reads the __bootloader_dfu/state symbols.
     let nvmc = Mutex::<NoopRawMutex, _>::new(BlockingAsync::new(Nvmc::new(p.NVMC)));
-    let mut aligned = AlignedBuffer([0u8; 4]);
-    let fw_config = FirmwareUpdaterConfig::from_linkerfile(&nvmc, &nvmc);
-    let mut updater = FirmwareUpdater::new(fw_config, &mut aligned.0);
 
     // Self-test proxy: reaching here means embassy + MPSL + the BLE controller
     // all came up. Confirm this boot so a just-swapped image sticks (BOOT_MAGIC)
     // instead of reverting on the next power-cycle. Harmless on a normal boot; a
     // bad image that crashes before this never marks booted -> WDT -> revert.
-    if let Ok(State::Revert) = updater.get_state().await {
-        info!("[ota] previous update was REVERTED by the bootloader");
+    {
+        let mut aligned = AlignedBuffer([0u8; 4]);
+        let cfg = FirmwareUpdaterConfig::from_linkerfile(&nvmc, &nvmc);
+        let mut updater = FirmwareUpdater::new(cfg, &mut aligned.0);
+        if let Ok(State::Revert) = updater.get_state().await {
+            info!("[ota] previous update was REVERTED by the bootloader");
+        }
+        let _ = updater.mark_booted().await;
     }
-    let _ = updater.mark_booted().await;
 
-    run(sdc, &mut updater).await;
+    run(sdc, &nvmc).await;
 }
 
-async fn run<C, DFU, STATE>(controller: C, updater: &mut FirmwareUpdater<'_, DFU, STATE>)
+async fn run<C, F>(controller: C, nvmc: &Mutex<NoopRawMutex, F>)
 where
     C: Controller,
-    DFU: embedded_storage_async::nor_flash::NorFlash,
-    STATE: embedded_storage_async::nor_flash::NorFlash,
+    F: embedded_storage_async::nor_flash::NorFlash,
 {
     let address: Address = Address::random([0xff, 0x8f, 0x1a, 0x05, 0xe4, 0xff]);
 
@@ -323,7 +323,13 @@ where
             match advertise(ADV_NAME, &mut peripheral, &server).await {
                 Ok(conn) => {
                     led(true); // connected: LED on
-                    ota_session(&server, &conn, updater).await;
+                    // Fresh updater per connection: write_firmware's last-erased
+                    // tracking resets, so a new push always erases sector 0 before
+                    // writing (stale tracking across pushes would corrupt DFU).
+                    let mut aligned = AlignedBuffer([0u8; 4]);
+                    let cfg = FirmwareUpdaterConfig::from_linkerfile(nvmc, nvmc);
+                    let mut updater = FirmwareUpdater::new(cfg, &mut aligned.0);
+                    ota_session(&server, &conn, &mut updater).await;
                 }
                 Err(_) => {
                     for _ in 0..3 {
