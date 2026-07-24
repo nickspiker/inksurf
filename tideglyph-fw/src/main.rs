@@ -138,10 +138,18 @@ fn park_rgb_leds() {
     }
 }
 
-// D9 diagnostic LED ditched (user request) — the panel is the real feedback now,
-// and leaving the pin as a floating input draws no current. led_init/led/stage
-// are kept as no-ops (still called for boot pacing) so the call sites stay put.
-fn led_init() {}
+// D9/P1.14 user LED (user-soldered, active-high): DRIVE IT OUTPUT-LOW so it's
+// definitively off — no drain, no glow. Leaving it a floating input was the bug:
+// a floating pin leaks enough to dimly light an active-high LED. Driving it low
+// (as the old boot code did between blinks) is why it read fully off before. Kept
+// off by default per the "no indication" request; led() stays a no-op so nothing
+// blinks it — trivially re-armable for diagnostics by having led() drive the pin.
+fn led_init() {
+    unsafe {
+        core::ptr::write_volatile(OUTCLR as *mut u32, 1 << LED); // OUT low first (no high glitch)
+        core::ptr::write_volatile(DIRSET as *mut u32, 1 << LED); // then make it an output
+    }
+}
 fn led(_on: bool) {}
 async fn stage(n: u32) {
     for _ in 0..n {
