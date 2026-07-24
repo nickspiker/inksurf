@@ -17,6 +17,7 @@ use embassy_embedded_hal::adapter::BlockingAsync;
 use embassy_executor::Spawner;
 use embassy_futures::join::join;
 use embassy_nrf::mode::Async;
+use embassy_nrf::gpio::{Level, Output, OutputDrive};
 use embassy_nrf::nvmc::Nvmc;
 use embassy_nrf::peripherals::{RNG, SAADC};
 use embassy_nrf::saadc::{self, Saadc};
@@ -152,12 +153,12 @@ bind_interrupts!(struct Irqs {
     RTC0 => nrf_sdc::mpsl::HighPrioInterruptHandler;
 });
 
-// Battery-voltage calibration. Divider is 1M/2M (÷1.5) on AIN0/P0.02, read at
-// 0.6V ref + 1/6 gain (3.6V full-scale) 12-bit. Nominal: batt_mV = raw * 5400/4096
-// (raw≈3185 at 4.20V). Refined from the real reading at a known 4.20V: set
-// BATT_CAL_NUM = 4200, BATT_CAL_DEN = <raw measured at 4.20V>.
-const BATT_CAL_NUM: u32 = 5400;
-const BATT_CAL_DEN: u32 = 4096;
+// Battery-voltage calibration for the XIAO ONBOARD divider (~÷3) on AIN7/P0.31,
+// gated by VBAT_ENABLE (P0.14). Calibrated against a known 4.20V cell: raw = 1599,
+// so batt_mV = raw * 4200/1599. Linear through origin — the onboard tap is a clean
+// resistive divider on BAT+ (no board pull), so one point is enough.
+const BATT_CAL_NUM: u32 = 4200;
+const BATT_CAL_DEN: u32 = 1599;
 
 #[embassy_executor::task]
 async fn mpsl_task(mpsl: &'static MultiprotocolServiceLayer<'static>) -> ! {
@@ -188,14 +189,21 @@ fn build_sdc<'d, const N: usize>(
         .build(p, rng, mpsl, mem)
 }
 
-/// One battery read via the SAADC on AIN0 (P0.02): 0.6V ref + 1/6 gain (3.6V
-/// full-scale) + 40µs acquisition (high-Z divider), 16x averaged. Returns
-/// (millivolts, raw 12-bit count).
+/// Battery read via the XIAO's ONBOARD ~÷3 divider on AIN7/P0.31, gated on by
+/// VBAT_ENABLE (P0.14, active low). 0.6V ref + 1/6 gain (3.6V FS) + 40µs
+/// acquisition, 16x averaged. Returns (millivolts, raw 12-bit count). Confirmed
+/// on HW: raw 1599 at a 4.20V cell. NOTE for panel integration: P0.31 also carries
+/// the panel DC net, so during a read set P0.31 to analog + enable the divider,
+/// and restore it to the DC output between reads (they never overlap).
 async fn read_battery(
     saadc_dev: embassy_nrf::Peri<'static, SAADC>,
-    ain0: embassy_nrf::Peri<'static, embassy_nrf::peripherals::P0_02>,
+    ain7: embassy_nrf::Peri<'static, embassy_nrf::peripherals::P0_31>,
+    vbat_en: embassy_nrf::Peri<'static, embassy_nrf::peripherals::P0_14>,
 ) -> (u16, u16) {
-    let mut cc = saadc::ChannelConfig::single_ended(ain0);
+    // Enable the onboard divider (active low), let it settle before sampling.
+    let _en = Output::new(vbat_en, Level::Low, OutputDrive::Standard);
+    Timer::after(Duration::from_millis(5)).await;
+    let mut cc = saadc::ChannelConfig::single_ended(ain7);
     cc.gain = saadc::Gain::Gain1_6;
     cc.reference = saadc::Reference::Internal;
     cc.time = saadc::Time::_40US;
@@ -313,8 +321,8 @@ async fn main(spawner: Spawner) {
     };
     stage(3).await; // SDC built
 
-    // Battery: one SAADC read on AIN0 (P0.02) through the ÷1.5 divider.
-    let batt = read_battery(p.SAADC, p.P0_02).await;
+    // Battery: one SAADC read on AIN1 (P0.03) through the ÷1.5 divider.
+    let batt = read_battery(p.SAADC, p.P0_31, p.P0_14).await;
     info!("[batt] {} mV (raw {})", batt.0, batt.1);
 
     // OTA flash: the app's own Nvmc behind a Mutex, shared with per-connection
