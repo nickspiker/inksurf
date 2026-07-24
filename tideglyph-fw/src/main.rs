@@ -414,6 +414,35 @@ fn interp(s: &[f32; N_SAMPLES], si: f32) -> f32 {
 /// Render a Bremerton tide chart centred on `unix` seconds into CANVAS, then
 /// pack into PANEL_FB. MVP: white bg, yellow tide-fill curve, black hourly ticks
 /// + a black "now" line down the centre. (Sun/moon/labels come later.)
+/// State of charge (0..=1000 permille) of a single LiPo cell from its resting
+/// terminal voltage, via a piecewise-linear discharge LUT. Valid at rest/low load
+/// — which is our case: we sample right before a refresh after minutes idle, so
+/// the reading is near open-circuit. Below 3.27V reads empty, at/above 4.20V full.
+fn batt_soc_permille(mv: u16) -> u32 {
+    // (mV, permille) descending — standard 1S LiPo resting discharge curve.
+    const LUT: [(u16, u16); 21] = [
+        (4200, 1000), (4150, 950), (4110, 900), (4080, 850), (4020, 800),
+        (3980, 750), (3950, 700), (3910, 650), (3870, 600), (3850, 550),
+        (3840, 500), (3820, 450), (3800, 400), (3790, 350), (3770, 300),
+        (3750, 250), (3730, 200), (3710, 150), (3690, 100), (3610, 50),
+        (3270, 0),
+    ];
+    if mv >= LUT[0].0 {
+        return 1000;
+    }
+    let last = LUT.len() - 1;
+    if mv <= LUT[last].0 {
+        return 0;
+    }
+    let mut i = 0;
+    while i < last && mv < LUT[i + 1].0 {
+        i += 1;
+    }
+    let (hv, hp) = LUT[i];
+    let (lv, lp) = LUT[i + 1];
+    lp as u32 + (hp - lp) as u32 * (mv - lv) as u32 / (hv - lv) as u32
+}
+
 async fn render_tide(unix: i64, batt_mv: u16) {
     let canvas = unsafe { &mut *core::ptr::addr_of_mut!(CANVAS) };
     for p in canvas.iter_mut() {
@@ -456,9 +485,12 @@ async fn render_tide(unix: i64, batt_mv: u16) {
     for y in 0..CH {
         canvas[y * CW + nx] = C_BLACK;
     }
-    // Battery gauge, top-left: outlined bar, filled proportional to 3000..4200 mV.
+    // Battery gauge, top-left: outlined bar filled proportional to STATE OF CHARGE
+    // (remaining capacity), not raw voltage — so each pixel is roughly equal used
+    // mAh. LiPo voltage-vs-capacity is very nonlinear (flat 3.7-3.9V plateau, steep
+    // ends), so a voltage bar reads full far too long then plummets.
     const BW: usize = 40;
-    let level = (batt_mv.saturating_sub(3000) as usize * (BW - 2) / 1200).min(BW - 2);
+    let level = (batt_soc_permille(batt_mv) as usize * (BW - 2) / 1000).min(BW - 2);
     for x in 2..2 + BW {
         canvas[2 * CW + x] = C_BLACK;
         canvas[6 * CW + x] = C_BLACK;
