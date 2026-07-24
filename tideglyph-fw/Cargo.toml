@@ -34,6 +34,7 @@ blake3 = { version = "1", default-features = false }
 # already locks, so no second embassy-nrf/embassy-sync gets pulled in.
 embassy-boot = { version = "0.7", default-features = false, features = ["defmt"] }
 embassy-embedded-hal = { version = "0.6", default-features = false }
+embedded-storage-async = "0.4"
 
 # Trust: keyed-BLAKE3 MAC (symmetric, 256-bit shared secret) — NOT Ed25519.
 # vsf here is only the manifest PARSER (default-features=false = no crypto-verify,

@@ -1567,6 +1567,7 @@ dependencies = [
  "embassy-sync",
  "embassy-time",
  "embedded-alloc",
+ "embedded-storage-async",
  "futures",
  "nrf-mpsl",
  "nrf-sdc",

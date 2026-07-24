@@ -37,6 +37,17 @@ fn now_stamp() -> i64 {
     vsf::eagle_time_oscillations()
 }
 
+/// Read the image and pad to a 4-byte boundary with 0xFF (erased-flash value) so
+/// every streamed DFU write lands aligned (flash WRITE_SIZE = 4). The MAC + size
+/// cover the padded image; the device writes + MACs the same padded bytes.
+fn read_image_padded(path: &str) -> Result<Vec<u8>> {
+    let mut image = std::fs::read(path).with_context(|| format!("read {path}"))?;
+    while image.len() % 4 != 0 {
+        image.push(0xFF);
+    }
+    Ok(image)
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let mut args = std::env::args().skip(1);
@@ -55,7 +66,7 @@ async fn main() -> Result<()> {
 
 fn cmd_manifest(image_path: &str) -> Result<()> {
     let key = ota_key()?;
-    let image = std::fs::read(image_path).with_context(|| format!("read {image_path}"))?;
+    let image = read_image_padded(image_path)?;
     let stamp = now_stamp();
     let manifest = manifest::build_manifest(&key, stamp, &image)?;
     let vstamp = manifest::verify_roundtrip(&key, &manifest, &image)?;
@@ -69,7 +80,7 @@ fn cmd_manifest(image_path: &str) -> Result<()> {
 
 async fn cmd_push(image_path: &str) -> Result<()> {
     let key = ota_key()?;
-    let image = std::fs::read(image_path).with_context(|| format!("read {image_path}"))?;
+    let image = read_image_padded(image_path)?;
     let stamp = now_stamp();
     let manifest = manifest::build_manifest(&key, stamp, &image)?;
     manifest::verify_roundtrip(&key, &manifest, &image)?; // never push what we can't verify

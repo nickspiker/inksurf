@@ -40,8 +40,8 @@ static HEAP: embedded_alloc::LlffHeap = embedded_alloc::LlffHeap::empty();
 const HEAP_SIZE: usize = 16 * 1024;
 static mut HEAP_MEM: [u8; HEAP_SIZE] = [0; HEAP_SIZE];
 
-/// This build's Eagle-time stamp — the downgrade FLOOR (see build.rs). An OTA
-/// manifest is accepted only if its stamp strictly exceeds this.
+// This build's Eagle-time stamp (FIRMWARE_BUILD_STAMP) — the downgrade FLOOR
+// (see build.rs). An OTA manifest is accepted only if its stamp exceeds this.
 include!(concat!(env!("OUT_DIR"), "/build_stamp.rs"));
 
 /// 256-bit shared secret for the OTA keyed-BLAKE3 MAC. Held on BOTH the device
@@ -175,23 +175,33 @@ fn build_sdc<'d, const N: usize>(
         .build(p, rng, mpsl, mem)
 }
 
-// GATT server: transfer-test service.
+// GATT server: OTA service.
+//   ctrl   BEGIN [0x01, image_len u32 LE, manifest_len u16 LE]; COMMIT [0x02]
+//   data   image bytes (image_len) then manifest bytes (manifest_len)
+//   status [state u8, verdict u8, received u32 LE]
+//          verdict: 0 idle, 1 receiving, 3 ACCEPTED (swap+reset imminent),
+//                   10 size-mismatch, 11 stale-stamp, 12 bad-MAC, 13 decode-fail
 #[gatt_server]
 struct Server {
-    xfer: XferService,
+    ota: OtaService,
 }
 
 #[gatt_service(uuid = "b5f90001-2d5a-4f3c-9b1a-1d2e3f405060")]
-struct XferService {
-    #[characteristic(uuid = "b5f90002-2d5a-4f3c-9b1a-1d2e3f405060", write)]
-    ctrl: u8,
+struct OtaService {
+    #[characteristic(uuid = "b5f90002-2d5a-4f3c-9b1a-1d2e3f405060", write, value = [0u8; 8])]
+    ctrl: [u8; 8],
     #[characteristic(uuid = "b5f90003-2d5a-4f3c-9b1a-1d2e3f405060", write, write_without_response, value = [0u8; 244])]
     data: [u8; 244],
-    #[characteristic(uuid = "b5f90004-2d5a-4f3c-9b1a-1d2e3f405060", read)]
-    hash: [u8; 32],
-    #[characteristic(uuid = "b5f90005-2d5a-4f3c-9b1a-1d2e3f405060", read)]
-    count: [u8; 4],
+    #[characteristic(uuid = "b5f90004-2d5a-4f3c-9b1a-1d2e3f405060", read, value = [0u8; 6])]
+    status: [u8; 6],
 }
+
+const V_RECEIVING: u8 = 1;
+const V_ACCEPTED: u8 = 3;
+const V_SIZE: u8 = 10;
+const V_STALE: u8 = 11;
+const V_BADMAC: u8 = 12;
+const V_DECODE: u8 = 13;
 
 #[embassy_executor::main]
 async fn main(spawner: Spawner) {
@@ -263,26 +273,32 @@ async fn main(spawner: Spawner) {
     };
     stage(3).await; // SDC built
 
-    // Self-test proxy: reaching here means embassy + MPSL + the BLE controller
-    // all came up. Confirm this boot so that if the bootloader just swapped in a
-    // new image, the swap sticks (BOOT_MAGIC) instead of reverting on the next
-    // power-cycle. Harmless no-op on a normal (non-swapped) boot. If a bad image
-    // crashes before this point, mark_booted is never reached -> WDT -> revert.
-    {
-        let nvmc = Mutex::<NoopRawMutex, _>::new(BlockingAsync::new(Nvmc::new(p.NVMC)));
-        let fw_config = FirmwareUpdaterConfig::from_linkerfile(&nvmc, &nvmc);
-        let mut aligned = AlignedBuffer([0u8; 4]);
-        let mut updater = FirmwareUpdater::new(fw_config, &mut aligned.0);
-        if let Ok(State::Revert) = updater.get_state().await {
-            info!("[ota] previous update was REVERTED by the bootloader");
-        }
-        let _ = updater.mark_booted().await;
-    }
+    // OTA updater over the app's own Nvmc — created here and kept live for the
+    // whole session so the GATT handler can stream into DFU + swap. from_linkerfile
+    // reads the __bootloader_dfu/state symbols (memory.x).
+    let nvmc = Mutex::<NoopRawMutex, _>::new(BlockingAsync::new(Nvmc::new(p.NVMC)));
+    let mut aligned = AlignedBuffer([0u8; 4]);
+    let fw_config = FirmwareUpdaterConfig::from_linkerfile(&nvmc, &nvmc);
+    let mut updater = FirmwareUpdater::new(fw_config, &mut aligned.0);
 
-    run(sdc).await;
+    // Self-test proxy: reaching here means embassy + MPSL + the BLE controller
+    // all came up. Confirm this boot so a just-swapped image sticks (BOOT_MAGIC)
+    // instead of reverting on the next power-cycle. Harmless on a normal boot; a
+    // bad image that crashes before this never marks booted -> WDT -> revert.
+    if let Ok(State::Revert) = updater.get_state().await {
+        info!("[ota] previous update was REVERTED by the bootloader");
+    }
+    let _ = updater.mark_booted().await;
+
+    run(sdc, &mut updater).await;
 }
 
-async fn run<C: Controller>(controller: C) {
+async fn run<C, DFU, STATE>(controller: C, updater: &mut FirmwareUpdater<'_, DFU, STATE>)
+where
+    C: Controller,
+    DFU: embedded_storage_async::nor_flash::NorFlash,
+    STATE: embedded_storage_async::nor_flash::NorFlash,
+{
     let address: Address = Address::random([0xff, 0x8f, 0x1a, 0x05, 0xe4, 0xff]);
 
     let mut resources: HostResources<DefaultPacketPool, CONNECTIONS_MAX, L2CAP_CHANNELS_MAX> = HostResources::new();
@@ -303,10 +319,9 @@ async fn run<C: Controller>(controller: C) {
             match advertise("tideglyph", &mut peripheral, &server).await {
                 Ok(conn) => {
                     led(true); // connected: LED on
-                    let _ = xfer_task(&server, &conn).await;
+                    ota_session(&server, &conn, updater).await;
                 }
                 Err(_) => {
-                    // Brief triple-flutter on advertise error, then retry.
                     for _ in 0..3 {
                         led(true);
                         Timer::after(Duration::from_millis(60)).await;
@@ -329,54 +344,133 @@ async fn ble_task<C: Controller, P: PacketPool>(mut runner: Runner<'_, C, P>) {
     }
 }
 
-/// Handle the transfer service until the connection closes: BEGIN resets the hasher, data writes feed it, COMMIT finalizes into the hash characteristic.
-async fn xfer_task<P: PacketPool>(server: &Server<'_>, conn: &GattConnection<'_, '_, P>) -> Result<(), Error> {
-    let ctrl = server.xfer.ctrl;
-    let data = server.xfer.data;
-    let hash = server.xfer.hash;
-    let count = server.xfer.count;
+/// Verify a staged update: parse the manifest, enforce the stamp floor, then
+/// recompute the keyed-BLAKE3 MAC over the DFU-flashed image (what will actually
+/// boot) and constant-time compare. Returns a verdict code.
+async fn ota_verify<DFU, STATE>(
+    updater: &mut FirmwareUpdater<'_, DFU, STATE>,
+    manifest: &[u8],
+    image_len: u32,
+) -> u8
+where
+    DFU: embedded_storage_async::nor_flash::NorFlash,
+    STATE: embedded_storage_async::nor_flash::NorFlash,
+{
+    let m = match parse_manifest(manifest) {
+        Ok(m) => m,
+        Err(_) => return V_DECODE,
+    };
+    if m.image_len != image_len {
+        return V_SIZE;
+    }
+    if m.stamp <= FIRMWARE_BUILD_STAMP {
+        return V_STALE; // downgrade floor — never accept an image older than the running build
+    }
+    let mut h = blake3::Hasher::new_keyed(&OTA_KEY);
+    h.update(OTA_DOMAIN);
+    h.update(&m.stamp.to_le_bytes());
+    h.update(&image_len.to_le_bytes());
+    let mut off = 0u32;
+    let mut buf = [0u8; 256];
+    while off < image_len {
+        let n = core::cmp::min(256, (image_len - off) as usize);
+        if updater.read_dfu(off, &mut buf[..n]).await.is_err() {
+            return V_DECODE;
+        }
+        h.update(&buf[..n]);
+        off += n as u32;
+    }
+    if ct_eq(h.finalize().as_bytes(), &m.mac) {
+        V_ACCEPTED
+    } else {
+        V_BADMAC
+    }
+}
 
-    let mut hasher = blake3::Hasher::new();
-    let mut total: u32 = 0;
-    let mut digest = [0u8; 32];
+/// Handle the OTA service for one connection: BEGIN sets sizes, data streams the
+/// image into DFU + buffers the manifest, COMMIT verifies + (if good) swaps.
+async fn ota_session<P, DFU, STATE>(
+    server: &Server<'_>,
+    conn: &GattConnection<'_, '_, P>,
+    updater: &mut FirmwareUpdater<'_, DFU, STATE>,
+) where
+    P: PacketPool,
+    DFU: embedded_storage_async::nor_flash::NorFlash,
+    STATE: embedded_storage_async::nor_flash::NorFlash,
+{
+    let ctrl_h = server.ota.ctrl;
+    let data_h = server.ota.data;
+    let status_ch = server.ota.status;
 
-    let _reason = loop {
+    let mut image_len = 0u32;
+    let mut manifest_len = 0usize;
+    let mut img_recv = 0u32;
+    let mut man_recv = 0usize;
+    let mut manifest_buf = [0u8; 512];
+
+    let set_status = |verdict: u8, recv: u32| {
+        let mut st = [0u8; 6];
+        st[0] = 1;
+        st[1] = verdict;
+        st[2..6].copy_from_slice(&recv.to_le_bytes());
+        let _ = server.set(&status_ch, &st);
+    };
+
+    loop {
         match conn.next().await {
-            GattConnectionEvent::Disconnected { reason } => break reason,
+            GattConnectionEvent::Disconnected { .. } => break,
             GattConnectionEvent::Gatt { event } => {
                 let reply = match event {
-                    // Reads are answered by the server from the attribute table; handlers below keep hash/count stored there up to date. (Do NOT use accept_unprocessed(&data) for reads — at this trouble rev it slices the response by MTU without bounding by data length and panics for short values.)
                     GattEvent::Read(event) => event.accept(),
                     GattEvent::Write(event) => {
-                        if event.handle() == data.handle {
-                            event.with_data(|_offset, bytes| {
-                                hasher.update(bytes);
-                                total = total.wrapping_add(bytes.len() as u32);
+                        if event.handle() == data_h.handle {
+                            let mut chunk = [0u8; 244];
+                            let mut clen = 0usize;
+                            event.with_data(|_o, b| {
+                                clen = b.len().min(244);
+                                chunk[..clen].copy_from_slice(&b[..clen]);
                             });
+                            // Route: image bytes -> DFU (aligned writes), then manifest -> RAM.
+                            let mut consumed = 0usize;
+                            if img_recv < image_len {
+                                let n = core::cmp::min((image_len - img_recv) as usize, clen);
+                                if updater.write_firmware(img_recv as usize, &chunk[..n]).await.is_ok() {
+                                    img_recv += n as u32;
+                                }
+                                consumed = n;
+                            }
+                            if consumed < clen && man_recv < manifest_len {
+                                let n = core::cmp::min(manifest_len - man_recv, clen - consumed)
+                                    .min(manifest_buf.len() - man_recv);
+                                manifest_buf[man_recv..man_recv + n]
+                                    .copy_from_slice(&chunk[consumed..consumed + n]);
+                                man_recv += n;
+                            }
+                            set_status(V_RECEIVING, img_recv);
                             event.accept_unprocessed()
-                        } else if event.handle() == ctrl.handle {
-                            let mut op = 0u8;
-                            event.with_data(|_offset, bytes| {
-                                if !bytes.is_empty() {
-                                    op = bytes[0];
-                                }
+                        } else if event.handle() == ctrl_h.handle {
+                            let mut cb = [0u8; 8];
+                            let mut cn = 0usize;
+                            event.with_data(|_o, b| {
+                                cn = b.len().min(8);
+                                cb[..cn].copy_from_slice(&b[..cn]);
                             });
-                            match op {
-                                0x01 => {
-                                    hasher.reset();
-                                    total = 0;
-                                    digest = [0u8; 32];
-                                    let _ = server.set(&hash, &digest);
-                                    let _ = server.set(&count, &[0u8; 4]);
-                                    info!("[xfer] BEGIN");
+                            if cn >= 7 && cb[0] == 0x01 {
+                                image_len = u32::from_le_bytes(cb[1..5].try_into().unwrap());
+                                manifest_len = u16::from_le_bytes(cb[5..7].try_into().unwrap()) as usize;
+                                img_recv = 0;
+                                man_recv = 0;
+                                info!("[ota] BEGIN image={} manifest={}", image_len, manifest_len);
+                                set_status(V_RECEIVING, 0);
+                            } else if cn >= 1 && cb[0] == 0x02 {
+                                let verdict = ota_verify(updater, &manifest_buf[..man_recv], image_len).await;
+                                info!("[ota] COMMIT verdict={} img_recv={}", verdict, img_recv);
+                                set_status(verdict, img_recv);
+                                if verdict == V_ACCEPTED {
+                                    let _ = updater.mark_updated().await;
+                                    Timer::after(Duration::from_secs(1)).await; // let host read status
+                                    cortex_m::peripheral::SCB::sys_reset();
                                 }
-                                0x02 => {
-                                    digest = *hasher.finalize().as_bytes();
-                                    let _ = server.set(&hash, &digest);
-                                    let _ = server.set(&count, &total.to_le_bytes());
-                                    info!("[xfer] COMMIT: {} bytes", total);
-                                }
-                                _ => {}
                             }
                             event.accept_unprocessed()
                         } else {
@@ -385,15 +479,13 @@ async fn xfer_task<P: PacketPool>(server: &Server<'_>, conn: &GattConnection<'_,
                     }
                     _ => event.accept(),
                 };
-                match reply {
-                    Ok(reply) => reply.send().await,
-                    Err(_) => {}
+                if let Ok(r) = reply {
+                    r.send().await;
                 }
             }
             _ => {}
         }
-    };
-    Ok(())
+    }
 }
 
 async fn advertise<'values, 'server, C: Controller>(
