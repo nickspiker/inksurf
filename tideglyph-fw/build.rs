@@ -19,9 +19,15 @@ fn main() {
     // be pushed an image older than the one it's running. Recomputed every build
     // (never cached) so the floor always advances.
     let stamp = vsf::eagle_time_oscillations();
+    // Build-time Unix seconds — used as an approximate "now" for the first tide
+    // render until the device gets a real time source (set over BLE).
+    let unix = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
     fs::write(
         out.join("build_stamp.rs"),
-        format!("pub const FIRMWARE_BUILD_STAMP: i64 = {stamp};\n"),
+        format!("pub const FIRMWARE_BUILD_STAMP: i64 = {stamp};\npub const BUILD_UNIX_SECS: i64 = {unix};\n"),
     )
     .expect("write build_stamp.rs");
     println!("cargo::rerun-if-changed=../ota_key.bin");

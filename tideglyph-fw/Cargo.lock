@@ -1550,6 +1550,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "tide-core"
+version = "0.1.0"
+dependencies = [
+ "libm",
+]
+
+[[package]]
 name = "tideglyph-fw"
 version = "0.1.0"
 dependencies = [
@@ -1573,6 +1580,7 @@ dependencies = [
  "nrf-sdc",
  "panic-probe",
  "static_cell",
+ "tide-core",
  "trouble-host",
  "vsf",
 ]

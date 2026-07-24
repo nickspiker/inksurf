@@ -338,6 +338,98 @@ impl<'d> Panel<'d> {
     }
 }
 
+// Tide render. User-facing canvas is 384 wide × 180 tall (landscape), one colour
+// code per pixel; pack() mirrors it into the 180×384 chip framebuffer.
+const CW: usize = 384;
+const CH: usize = 180;
+const TIDE_MIN_FT: f32 = -4.61; // MLLW y-axis bounds (match tide-display)
+const TIDE_MAX_FT: f32 = 14.09;
+const MSL_TO_MLLW: f32 = 6.814; // tide-core predicts MSL; display axis is MLLW
+const N_SAMPLES: usize = 241; // ±12h at 6-min steps
+// Zero-init so it lands in .bss (RAM only, not stored in FLASH). render_tide
+// fills it white before drawing, so the initial value doesn't matter.
+static mut CANVAS: [u8; CW * CH] = [0u8; CW * CH];
+
+fn interp(s: &[f32; N_SAMPLES], si: f32) -> f32 {
+    if si <= 0.0 {
+        return s[0];
+    }
+    if si >= (N_SAMPLES - 1) as f32 {
+        return s[N_SAMPLES - 1];
+    }
+    let i = si as usize;
+    let frac = si - i as f32;
+    s[i] + frac * (s[i + 1] - s[i])
+}
+
+/// Render a Bremerton tide chart centred on `unix` seconds into CANVAS, then
+/// pack into PANEL_FB. MVP: white bg, yellow tide-fill curve, black hourly ticks
+/// + a black "now" line down the centre. (Sun/moon/labels come later.)
+async fn render_tide(unix: i64) {
+    let canvas = unsafe { &mut *core::ptr::addr_of_mut!(CANVAS) };
+    for p in canvas.iter_mut() {
+        *p = C_WHITE;
+    }
+    // 241 tide samples over ±12h, MLLW feet. Software f64 trig is slow, so yield
+    // periodically — otherwise this synchronous loop starves the WDT-pet task and
+    // the watchdog reboots us mid-render.
+    let mut samples = [0f32; N_SAMPLES];
+    let base = unix - 12 * 3600;
+    for i in 0..N_SAMPLES {
+        let t = (base + 6 * 60 * i as i64) as f64;
+        samples[i] = tide_core::predict(tide_core::BREMERTON, t) as f32 + MSL_TO_MLLW;
+        if i % 8 == 0 {
+            embassy_futures::yield_now().await;
+        }
+    }
+    // Curve fill: 24h window, now at centre; yellow from the curve to the bottom.
+    let range = TIDE_MAX_FT - TIDE_MIN_FT;
+    for x in 0..CW {
+        let secs_from_now = (x as f32 - CW as f32 / 2.0) / CW as f32 * 86400.0;
+        let si = (secs_from_now + 12.0 * 3600.0) / 360.0; // sample index
+        let h = interp(&samples, si);
+        let tt = ((h - TIDE_MIN_FT) / range).clamp(0.0, 1.0);
+        let y = ((CH as f32 - 1.0) - tt * (CH as f32 - 1.0)) as usize;
+        for yy in y..CH {
+            canvas[yy * CW + x] = C_YELLOW;
+        }
+    }
+    // Hourly ticks (black, top + bottom edge).
+    for hh in -12..=12i32 {
+        let x = (CW as f32 / 2.0 + hh as f32 * 3600.0 / 86400.0 * CW as f32) as i32;
+        if x >= 0 && x < CW as i32 {
+            canvas[x as usize] = C_BLACK;
+            canvas[(CH - 1) * CW + x as usize] = C_BLACK;
+        }
+    }
+    // "Now" line, black, down the centre.
+    let nx = CW / 2;
+    for y in 0..CH {
+        canvas[y * CW + nx] = C_BLACK;
+    }
+    pack(canvas);
+}
+
+/// Mirror the landscape canvas into the chip framebuffer (2bpp, x-mirrored, MSB
+/// first) — the pack_to_chip transform from tide-display.
+fn pack(canvas: &[u8; CW * CH]) {
+    let fb = unsafe { &mut *core::ptr::addr_of_mut!(PANEL_FB) };
+    for b in fb.iter_mut() {
+        *b = 0x55; // all white
+    }
+    for y in 0..CH {
+        for x in 0..CW {
+            let code = canvas[y * CW + x] & 0x3;
+            let chip_row = CW - 1 - x;
+            let chip_col = y;
+            let byte_idx = chip_row * PROW + chip_col / 4;
+            let shift = (3 - (chip_col % 4)) * 2;
+            let mask = !(0b11u8 << shift);
+            fb[byte_idx] = (fb[byte_idx] & mask) | (code << shift);
+        }
+    }
+}
+
 #[embassy_executor::main]
 async fn main(spawner: Spawner) {
     unsafe { HEAP.init(core::ptr::addr_of_mut!(HEAP_MEM) as usize, HEAP_SIZE) }
@@ -417,23 +509,10 @@ async fn main(spawner: Spawner) {
     // FirmwareUpdaters. from_linkerfile reads the __bootloader_dfu/state symbols.
     let nvmc = Mutex::<NoopRawMutex, _>::new(BlockingAsync::new(Nvmc::new(p.NVMC)));
 
-    // Self-test proxy: reaching here means embassy + MPSL + the BLE controller
-    // all came up. Confirm this boot so a just-swapped image sticks (BOOT_MAGIC)
-    // instead of reverting on the next power-cycle. Harmless on a normal boot; a
-    // bad image that crashes before this never marks booted -> WDT -> revert.
-    {
-        let mut aligned = AlignedBuffer([0u8; 4]);
-        let cfg = FirmwareUpdaterConfig::from_linkerfile(&nvmc, &nvmc);
-        let mut updater = FirmwareUpdater::new(cfg, &mut aligned.0);
-        if let Ok(State::Revert) = updater.get_state().await {
-            info!("[ota] previous update was REVERTED by the bootloader");
-        }
-        let _ = updater.mark_booted().await;
-    }
-
-    // Drive the panel: init + a 4-colour band test frame (embassy-nrf SPIM port of
-    // the proven JD79667 driver). The ~15s refresh is async, so the WDT-pet task
-    // keeps running. E-paper holds the image after, even once these pins drop.
+    // Drive the panel: render the tide chart + refresh (embassy-nrf SPIM port of
+    // the proven JD79667 driver). The render yields and the ~15s refresh is async,
+    // so the WDT-pet task keeps running. mark_booted is DELIBERATELY after this so
+    // a bad render/panel that hangs never confirms -> WDT -> bootloader reverts.
     {
         let mut sc = spim::Config::default();
         sc.frequency = spim::Frequency::M8;
@@ -446,23 +525,24 @@ async fn main(spawner: Spawner) {
             busy: Input::new(p.P0_29, Pull::None),
             en: Output::new(p.P1_11, Level::Low, OutputDrive::Standard),
         };
-        let fb = unsafe { &mut *core::ptr::addr_of_mut!(PANEL_FB) };
-        for row in 0..PH {
-            let color = match row * 4 / PH {
-                0 => C_BLACK,
-                1 => C_WHITE,
-                2 => C_YELLOW,
-                _ => C_RED,
-            };
-            let byte = (color << 6) | (color << 4) | (color << 2) | color;
-            for c in 0..PROW {
-                fb[row * PROW + c] = byte;
-            }
-        }
+        render_tide(BUILD_UNIX_SECS).await; // fills PANEL_FB with the tide chart
         panel.init().await;
         let fb = unsafe { &*core::ptr::addr_of!(PANEL_FB) };
         panel.push(fb).await;
-        info!("[panel] 4-band frame refreshed");
+        info!("[panel] tide chart refreshed for unix {}", BUILD_UNIX_SECS);
+    }
+
+    // Confirm the boot ONLY after a successful render + panel drive (the self-test).
+    // A bad render/panel that hangs never reaches here -> WDT -> bootloader reverts
+    // to the previous good image, no cable needed.
+    {
+        let mut aligned = AlignedBuffer([0u8; 4]);
+        let cfg = FirmwareUpdaterConfig::from_linkerfile(&nvmc, &nvmc);
+        let mut updater = FirmwareUpdater::new(cfg, &mut aligned.0);
+        if let Ok(State::Revert) = updater.get_state().await {
+            info!("[ota] previous update was REVERTED by the bootloader");
+        }
+        let _ = updater.mark_booted().await;
     }
 
     run(sdc, &nvmc, batt).await;
