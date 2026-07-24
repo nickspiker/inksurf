@@ -34,7 +34,17 @@ fn ota_key() -> Result<[u8; 32]> {
 }
 
 fn now_stamp() -> i64 {
+    // OTA_STAMP overrides for testing the downgrade floor (e.g. OTA_STAMP=1).
+    if let Ok(s) = std::env::var("OTA_STAMP") {
+        if let Ok(v) = s.parse::<i64>() {
+            return v;
+        }
+    }
     vsf::eagle_time_oscillations()
+}
+
+fn target_name() -> String {
+    std::env::var("OTA_NAME").unwrap_or_else(|_| "tideglyph".to_string())
 }
 
 /// Read the image and pad to a 4-byte boundary with 0xFF (erased-flash value) so
@@ -84,17 +94,18 @@ async fn cmd_push(image_path: &str) -> Result<()> {
     let stamp = now_stamp();
     let manifest = manifest::build_manifest(&key, stamp, &image)?;
     manifest::verify_roundtrip(&key, &manifest, &image)?; // never push what we can't verify
-    println!("image {} bytes, manifest {} bytes, stamp {stamp}", image.len(), manifest.len());
+    let name = target_name();
+    println!("image {} bytes, manifest {} bytes, stamp {stamp}, target {name}", image.len(), manifest.len());
 
     let central = Manager::new().await?.adapters().await?.into_iter().next().context("no BLE adapter")?;
-    println!("scanning for tideglyph…");
+    println!("scanning for {name}…");
     central.start_scan(ScanFilter::default()).await?;
     let dev = 'f: {
         for _ in 0..60 {
             tokio::time::sleep(Duration::from_millis(500)).await;
             for p in central.peripherals().await? {
                 if let Ok(Some(pr)) = p.properties().await {
-                    if pr.local_name.as_deref() == Some("tideglyph") {
+                    if pr.local_name.as_deref() == Some(name.as_str()) {
                         break 'f p;
                     }
                 }
