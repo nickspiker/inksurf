@@ -33,6 +33,10 @@ use {defmt_rtt as _, panic_probe as _};
 const CONNECTIONS_MAX: usize = 1;
 const L2CAP_CHANNELS_MAX: usize = 2; // signal + att
 
+/// BLE advertised name. Bumped per build so an OTA swap is observable on-air
+/// (v1 advertises "tideglyph", the pushed v2 will announce a different name).
+const ADV_NAME: &str = "tideglyph";
+
 // Global allocator — vsf's verify path uses alloc (Vec/String while parsing the
 // signed manifest). 16 KB is ample for a few-hundred-byte manifest doc.
 #[global_allocator]
@@ -309,14 +313,14 @@ where
     let mut peripheral = stack.peripheral();
 
     let server = unwrap!(Server::new_with_config(GapConfig::Peripheral(PeripheralConfig {
-        name: "tideglyph",
+        name: ADV_NAME,
         appearance: &appearance::power_device::GENERIC_POWER_DEVICE,
     })));
 
     let _ = join(ble_task(runner), async {
         loop {
             led(false); // advertising: LED off
-            match advertise("tideglyph", &mut peripheral, &server).await {
+            match advertise(ADV_NAME, &mut peripheral, &server).await {
                 Ok(conn) => {
                     led(true); // connected: LED on
                     ota_session(&server, &conn, updater).await;
@@ -416,6 +420,7 @@ async fn ota_session<P, DFU, STATE>(
         let _ = server.set(&status_ch, &st);
     };
 
+    let mut commit_pending = false;
     loop {
         match conn.next().await {
             GattConnectionEvent::Disconnected { .. } => break,
@@ -463,14 +468,10 @@ async fn ota_session<P, DFU, STATE>(
                                 info!("[ota] BEGIN image={} manifest={}", image_len, manifest_len);
                                 set_status(V_RECEIVING, 0);
                             } else if cn >= 1 && cb[0] == 0x02 {
-                                let verdict = ota_verify(updater, &manifest_buf[..man_recv], image_len).await;
-                                info!("[ota] COMMIT verdict={} img_recv={}", verdict, img_recv);
-                                set_status(verdict, img_recv);
-                                if verdict == V_ACCEPTED {
-                                    let _ = updater.mark_updated().await;
-                                    Timer::after(Duration::from_secs(1)).await; // let host read status
-                                    cortex_m::peripheral::SCB::sys_reset();
-                                }
+                                // Reply to COMMIT FAST (status=verifying); do the heavy
+                                // verify AFTER the reply so the host's write doesn't time out.
+                                set_status(2, img_recv);
+                                commit_pending = true;
                             }
                             event.accept_unprocessed()
                         } else {
@@ -481,6 +482,22 @@ async fn ota_session<P, DFU, STATE>(
                 };
                 if let Ok(r) = reply {
                     r.send().await;
+                }
+                if commit_pending {
+                    commit_pending = false;
+                    // Fast-reject an incomplete transfer without reading DFU.
+                    let verdict = if img_recv != image_len || man_recv != manifest_len {
+                        V_SIZE
+                    } else {
+                        ota_verify(updater, &manifest_buf[..man_recv], image_len).await
+                    };
+                    info!("[ota] COMMIT verdict={} img_recv={}", verdict, img_recv);
+                    set_status(verdict, img_recv);
+                    if verdict == V_ACCEPTED {
+                        let _ = updater.mark_updated().await;
+                        Timer::after(Duration::from_secs(1)).await; // let host read status
+                        cortex_m::peripheral::SCB::sys_reset();
+                    }
                 }
             }
             _ => {}

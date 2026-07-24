@@ -121,7 +121,10 @@ async fn cmd_push(image_path: &str) -> Result<()> {
     let total = image.len() + manifest.len();
     for byte_stream in [image.as_slice(), manifest.as_slice()] {
         for chunk in byte_stream.chunks(CHUNK) {
-            dev.write(&data, chunk, WriteType::WithoutResponse).await?;
+            // WithResponse: each write is acked before the next, so nothing is
+            // dropped and COMMIT can't overtake the data (write-without-response
+            // gets buffered + lost on BlueZ with no flow control).
+            dev.write(&data, chunk, WriteType::WithResponse).await?;
             sent += chunk.len();
             if sent % (CHUNK * 40) < CHUNK {
                 print!("\r  {sent}/{total} bytes ({:.0} B/s)", sent as f64 / t0.elapsed().as_secs_f64());
@@ -132,9 +135,10 @@ async fn cmd_push(image_path: &str) -> Result<()> {
     }
     println!("\r  {sent}/{total} bytes in {:.1}s ({:.0} B/s)      ", t0.elapsed().as_secs_f64(), sent as f64 / t0.elapsed().as_secs_f64());
 
-    // COMMIT → device verifies, then either sets ACCEPTED + resets (connection drops) or reports an error
-    dev.write(&ctrl, &[COMMIT], WriteType::WithResponse).await?;
-    for _ in 0..20 {
+    // COMMIT → device replies fast (status=verifying) then verifies; tolerate the
+    // write result and poll status for the real verdict.
+    let _ = dev.write(&ctrl, &[COMMIT], WriteType::WithResponse).await;
+    for _ in 0..40 {
         tokio::time::sleep(Duration::from_millis(300)).await;
         match dev.read(&status).await {
             Ok(s) if s.len() >= 6 => {
