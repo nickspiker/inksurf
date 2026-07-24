@@ -121,13 +121,11 @@ const OUTSET: u32 = P1_BASE + 0x508;
 const OUTCLR: u32 = P1_BASE + 0x50C;
 const LED: u32 = 14;
 
-fn led_init() {
-    unsafe { core::ptr::write_volatile(DIRSET as *mut u32, 1 << LED) }
-}
-fn led(on: bool) {
-    let reg = if on { OUTSET } else { OUTCLR };
-    unsafe { core::ptr::write_volatile(reg as *mut u32, 1 << LED) }
-}
+// D9 diagnostic LED ditched (user request) — the panel is the real feedback now,
+// and leaving the pin as a floating input draws no current. led_init/led/stage
+// are kept as no-ops (still called for boot pacing) so the call sites stay put.
+fn led_init() {}
+fn led(_on: bool) {}
 async fn stage(n: u32) {
     for _ in 0..n {
         led(true);
@@ -330,11 +328,15 @@ impl<'d> Panel<'d> {
         self.dc.set_high();
         let _ = self.spi.write(fb).await;
         self.cs.set_high();
-        info!("[panel] framebuffer sent, refreshing; BUSY high? {}", self.busy.is_high());
         self.cmd(0x12, &[0x00]).await; // DRF refresh
-        Timer::after(Duration::from_millis(50)).await;
-        info!("[panel] DRF sent, BUSY high (should be LOW=busy now)? {}", self.busy.is_high());
         self.wait_ready().await;
+        // POWER OFF (0x02): shut the drivers down so the image is passively
+        // retained. Without this the panel stays actively biased and the image
+        // slowly fades/ghosts. (Deep-sleep 0x07 deferred — needs a verified wake
+        // sequence before we risk it on the glued unit.)
+        self.cmd(0x02, &[]).await;
+        Timer::after(Duration::from_millis(100)).await;
+        info!("[panel] refreshed + powered off");
     }
 }
 
