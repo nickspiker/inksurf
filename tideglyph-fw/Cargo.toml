@@ -35,9 +35,12 @@ blake3 = { version = "1", default-features = false }
 embassy-boot = { version = "0.7", default-features = false, features = ["defmt"] }
 embassy-embedded-hal = { version = "0.6", default-features = false }
 
-# Trust: VSF signature verification on-device. crypto-verify = Ed25519 verify
-# (no RNG) + BLAKE3, no_std. Needs an allocator (vsf uses alloc).
-vsf = { path = "../../vsf", default-features = false, features = ["crypto-verify"] }
+# Trust: keyed-BLAKE3 MAC (symmetric, 256-bit shared secret) — NOT Ed25519.
+# vsf here is only the manifest PARSER (default-features=false = no crypto-verify,
+# so ed25519-dalek/curve25519 are not pulled: ~130 KB saved). The auth is
+# blake3::keyed_hash over the image, carried in the manifest's gH field. vsf's
+# parser uses alloc, hence embedded-alloc.
+vsf = { path = "../../vsf", default-features = false }
 embedded-alloc = "0.6"
 
 [patch.crates-io]

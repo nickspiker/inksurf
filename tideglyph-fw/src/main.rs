@@ -40,20 +40,68 @@ static HEAP: embedded_alloc::LlffHeap = embedded_alloc::LlffHeap::empty();
 const HEAP_SIZE: usize = 16 * 1024;
 static mut HEAP_MEM: [u8; HEAP_SIZE] = [0; HEAP_SIZE];
 
-/// Ed25519 public key the OTA release manifest must be signed by. Placeholder
-/// zeros until the real release key is generated host-side (tideglyph-push).
+/// 256-bit shared secret for the OTA keyed-BLAKE3 MAC. Held on BOTH the device
+/// (here) and the host signer (tideglyph-push). Whoever holds it can author
+/// updates; whoever doesn't, can't forge one. Placeholder zeros until the real
+/// key is generated host-side. KEEP IT SECRET; recovery from a bad push is a
+/// USB double-tap reflash.
 #[allow(dead_code)] // wired into COMMIT in the OTA-protocol step
-const RELEASE_PUBKEY: [u8; 32] = [0u8; 32];
+const OTA_KEY: [u8; 32] = [0u8; 32];
+/// Domain separation — bound into the MAC so this key can't be replayed cross-protocol.
+const OTA_DOMAIN: &[u8] = b"tideglyph-ota-v1";
 
-/// Verify a signed VSF manifest is authentic + from our release signer. Returns
-/// the decoded header on success. This is the single trust gate — a bad
-/// provenance, signature, or signer is rejected here.
+/// The trust-bearing fields lifted out of a manifest.
+#[allow(dead_code)]
+struct OtaManifest {
+    stamp: i64,      // Eagle-time oscillations; must exceed FIRMWARE_BUILD_STAMP (downgrade floor)
+    image_len: u32,  // raw firmware bytes staged in DFU
+    mac: [u8; 32],   // keyed_hash(OTA_KEY, OTA_DOMAIN || stamp_le || image_len_le || image)
+}
+
+/// Parse + integrity-check a VSF manifest and lift the trust fields. Does NOT
+/// authenticate — the caller must recompute the keyed MAC over the DFU image and
+/// constant-time compare against `mac`, plus enforce the stamp floor.
 #[allow(dead_code)] // wired into COMMIT in the OTA-protocol step
-fn verify_manifest(manifest: &[u8]) -> Result<vsf::file_format::VsfHeader, ()> {
-    match vsf::verification::read_verified(manifest, Some(RELEASE_PUBKEY)) {
-        Ok((header, _end)) => Ok(header),
-        Err(_) => Err(()),
+fn parse_manifest(manifest: &[u8]) -> Result<OtaManifest, &'static str> {
+    let (header, end) = vsf::verification::read_verified(manifest, None).map_err(|_| "decode")?;
+    let stamp = match &header.creation_time {
+        Some(vsf::types::VsfType::e(vsf::types::EtType::e6(o))) => *o,
+        _ => return Err("no stamp"),
+    };
+    let sections = header.sections(manifest, end).map_err(|_| "sections")?;
+    let sec = sections
+        .iter()
+        .find(|s| s.name == "firmware.tideglyph")
+        .ok_or("no fw section")?;
+    let image_len = sec
+        .get_fields("size")
+        .first()
+        .and_then(|f| f.values.first())
+        .and_then(|v| match v {
+            vsf::types::VsfType::z(n) => Some(*n as u32),
+            _ => None,
+        })
+        .ok_or("no size")?;
+    let mac: [u8; 32] = sec
+        .get_fields("mac")
+        .first()
+        .and_then(|f| f.values.first())
+        .and_then(|v| match v {
+            vsf::types::VsfType::gH(h) if h.len() == 32 => h.as_slice().try_into().ok(),
+            _ => None,
+        })
+        .ok_or("no mac")?;
+    Ok(OtaManifest { stamp, image_len, mac })
+}
+
+/// Constant-time 32-byte compare (don't leak MAC bytes via timing).
+#[allow(dead_code)]
+fn ct_eq(a: &[u8; 32], b: &[u8; 32]) -> bool {
+    let mut diff = 0u8;
+    for i in 0..32 {
+        diff |= a[i] ^ b[i];
     }
+    diff == 0
 }
 
 // D9 = P1.14 diagnostic LED, direct registers (independent of any HAL state).
