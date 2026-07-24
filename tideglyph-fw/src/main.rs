@@ -365,7 +365,7 @@ fn interp(s: &[f32; N_SAMPLES], si: f32) -> f32 {
 /// Render a Bremerton tide chart centred on `unix` seconds into CANVAS, then
 /// pack into PANEL_FB. MVP: white bg, yellow tide-fill curve, black hourly ticks
 /// + a black "now" line down the centre. (Sun/moon/labels come later.)
-async fn render_tide(unix: i64) {
+async fn render_tide(unix: i64, batt_mv: u16) {
     let canvas = unsafe { &mut *core::ptr::addr_of_mut!(CANVAS) };
     for p in canvas.iter_mut() {
         *p = C_WHITE;
@@ -406,6 +406,22 @@ async fn render_tide(unix: i64) {
     let nx = CW / 2;
     for y in 0..CH {
         canvas[y * CW + nx] = C_BLACK;
+    }
+    // Battery gauge, top-left: outlined bar, filled proportional to 3000..4200 mV.
+    const BW: usize = 40;
+    let level = (batt_mv.saturating_sub(3000) as usize * (BW - 2) / 1200).min(BW - 2);
+    for x in 2..2 + BW {
+        canvas[2 * CW + x] = C_BLACK;
+        canvas[6 * CW + x] = C_BLACK;
+    }
+    for y in 2..=6 {
+        canvas[y * CW + 2] = C_BLACK;
+        canvas[y * CW + (1 + BW)] = C_BLACK;
+    }
+    for y in 3..6 {
+        for x in 3..3 + level {
+            canvas[y * CW + x] = C_BLACK;
+        }
     }
     pack(canvas);
 }
@@ -500,10 +516,13 @@ async fn main(spawner: Spawner) {
     };
     stage(3).await; // SDC built
 
-    // Battery read is skipped this build: P0.31 is time-shared with panel DC and
-    // the panel owns it here. (Battery time-share comes with the render loop.)
-    let batt = (0u16, 0u16);
-    let _ = read_battery; // keep it compiled for the next milestone
+    // Read the battery via the onboard divider (P0.31/AIN7 + P0.14 gate) BEFORE
+    // driving the panel — the user's trick: any disturbance the divider puts on the
+    // shared P0.31 DC net gets repainted over immediately. Clone P0.31 so it can be
+    // reused as panel DC once the SAADC read is done (strictly sequential use).
+    let dc_pin = unsafe { p.P0_31.clone_unchecked() };
+    let batt = read_battery(p.SAADC, p.P0_31, p.P0_14).await;
+    info!("[batt] {} mV (raw {})", batt.0, batt.1);
 
     // OTA flash: the app's own Nvmc behind a Mutex, shared with per-connection
     // FirmwareUpdaters. from_linkerfile reads the __bootloader_dfu/state symbols.
@@ -520,12 +539,12 @@ async fn main(spawner: Spawner) {
         let mut panel = Panel {
             spi,
             cs: Output::new(p.P1_12, Level::High, OutputDrive::Standard),
-            dc: Output::new(p.P0_31, Level::Low, OutputDrive::Standard),
+            dc: Output::new(dc_pin, Level::Low, OutputDrive::Standard),
             rst: Output::new(p.P0_15, Level::High, OutputDrive::Standard),
             busy: Input::new(p.P0_29, Pull::None),
             en: Output::new(p.P1_11, Level::Low, OutputDrive::Standard),
         };
-        render_tide(BUILD_UNIX_SECS).await; // fills PANEL_FB with the tide chart
+        render_tide(BUILD_UNIX_SECS, batt.0).await; // fills PANEL_FB with the tide chart
         panel.init().await;
         let fb = unsafe { &*core::ptr::addr_of!(PANEL_FB) };
         panel.push(fb).await;
