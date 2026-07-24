@@ -17,10 +17,11 @@ use embassy_embedded_hal::adapter::BlockingAsync;
 use embassy_executor::Spawner;
 use embassy_futures::join::join;
 use embassy_nrf::mode::Async;
-use embassy_nrf::gpio::{Level, Output, OutputDrive};
+use embassy_nrf::gpio::{Input, Level, Output, OutputDrive, Pull};
 use embassy_nrf::nvmc::Nvmc;
-use embassy_nrf::peripherals::{RNG, SAADC};
+use embassy_nrf::peripherals::{RNG, SAADC, TWISPI0};
 use embassy_nrf::saadc::{self, Saadc};
+use embassy_nrf::spim::{self, Spim};
 use embassy_nrf::wdt::{self, Watchdog, WatchdogHandle};
 use embassy_nrf::{bind_interrupts, rng};
 use embassy_sync::blocking_mutex::raw::NoopRawMutex;
@@ -146,6 +147,7 @@ unsafe fn pre_init() {
 bind_interrupts!(struct Irqs {
     RNG => rng::InterruptHandler<RNG>;
     SAADC => saadc::InterruptHandler;
+    TWISPI0 => spim::InterruptHandler<TWISPI0>;
     EGU0_SWI0 => nrf_sdc::mpsl::LowPrioInterruptHandler;
     CLOCK_POWER => nrf_sdc::mpsl::ClockInterruptHandler;
     RADIO => nrf_sdc::mpsl::HighPrioInterruptHandler;
@@ -251,6 +253,91 @@ const V_STALE: u8 = 11;
 const V_BADMAC: u8 = 12;
 const V_DECODE: u8 = 13;
 
+// JD79667 panel (Adafruit 6414 BWRY) on the EN04/EN05 board. Chip-internal
+// geometry 180 wide × 384 tall, 2 bits/px (4 px/byte, MSB first). Init/timing
+// ported from inksurf's proven src/panel_jd79667.rs. BUSY LOW = busy.
+const PW: usize = 180;
+const PH: usize = 384;
+const PROW: usize = PW / 4; // 45 bytes/row
+const FB_BYTES: usize = 17_664;
+const C_BLACK: u8 = 0b00;
+const C_WHITE: u8 = 0b01;
+const C_YELLOW: u8 = 0b10;
+const C_RED: u8 = 0b11;
+static mut PANEL_FB: [u8; FB_BYTES] = [0u8; FB_BYTES];
+
+struct Panel<'d> {
+    spi: Spim<'d>,
+    cs: Output<'d>,
+    dc: Output<'d>,
+    rst: Output<'d>,
+    busy: Input<'d>,
+    en: Output<'d>,
+}
+
+impl<'d> Panel<'d> {
+    /// Wait for BUSY to go HIGH (idle). Async so the WDT-pet task runs meanwhile.
+    async fn wait_ready(&mut self) {
+        for _ in 0..30_000 {
+            if self.busy.is_high() {
+                return;
+            }
+            Timer::after(Duration::from_millis(1)).await;
+        }
+    }
+    async fn cmd(&mut self, c: u8, data: &[u8]) {
+        self.dc.set_low();
+        self.cs.set_low();
+        let _ = self.spi.write(&[c]).await;
+        self.dc.set_high();
+        if !data.is_empty() {
+            let _ = self.spi.write(data).await;
+        }
+        self.cs.set_high();
+    }
+    async fn init(&mut self) {
+        self.en.set_high(); // power the panel
+        Timer::after(Duration::from_millis(10)).await;
+        self.rst.set_low();
+        Timer::after(Duration::from_millis(50)).await;
+        self.rst.set_high();
+        Timer::after(Duration::from_millis(100)).await;
+        info!("[panel] post-reset BUSY high? {}", self.busy.is_high());
+        self.wait_ready().await;
+        info!("[panel] ready, sending init");
+        self.cmd(0x4D, &[0x78]).await;
+        self.cmd(0x00, &[0x0F, 0x29]).await; // PSR
+        self.cmd(0x01, &[0x07, 0x00]).await; // PWRR
+        self.cmd(0x03, &[0x10, 0x54, 0x44]).await; // POFS
+        self.cmd(0x06, &[0x05, 0x00, 0x3F, 0x0A, 0x25, 0x12, 0x1A]).await; // BTST
+        self.cmd(0x50, &[0x37]).await; // CDI
+        self.cmd(0x60, &[0x02, 0x02]).await; // TCON
+        self.cmd(0x61, &[0x00, 0xB4, 0x01, 0x80]).await; // TRES 180×384
+        self.cmd(0xE7, &[0x1C]).await;
+        self.cmd(0xE3, &[0x22]).await;
+        self.cmd(0xB4, &[0xD0]).await;
+        self.cmd(0xB5, &[0x03]).await;
+        self.cmd(0xE9, &[0x01]).await;
+        self.cmd(0x30, &[0x08]).await; // PLL
+        self.cmd(0x04, &[]).await; // POWER ON
+        self.wait_ready().await;
+    }
+    /// Stream the framebuffer (DTM 0x10) and refresh (DRF 0x12). ~15s async.
+    async fn push(&mut self, fb: &[u8]) {
+        self.dc.set_low();
+        self.cs.set_low();
+        let _ = self.spi.write(&[0x10]).await; // DTM
+        self.dc.set_high();
+        let _ = self.spi.write(fb).await;
+        self.cs.set_high();
+        info!("[panel] framebuffer sent, refreshing; BUSY high? {}", self.busy.is_high());
+        self.cmd(0x12, &[0x00]).await; // DRF refresh
+        Timer::after(Duration::from_millis(50)).await;
+        info!("[panel] DRF sent, BUSY high (should be LOW=busy now)? {}", self.busy.is_high());
+        self.wait_ready().await;
+    }
+}
+
 #[embassy_executor::main]
 async fn main(spawner: Spawner) {
     unsafe { HEAP.init(core::ptr::addr_of_mut!(HEAP_MEM) as usize, HEAP_SIZE) }
@@ -321,9 +408,10 @@ async fn main(spawner: Spawner) {
     };
     stage(3).await; // SDC built
 
-    // Battery: one SAADC read on AIN1 (P0.03) through the ÷1.5 divider.
-    let batt = read_battery(p.SAADC, p.P0_31, p.P0_14).await;
-    info!("[batt] {} mV (raw {})", batt.0, batt.1);
+    // Battery read is skipped this build: P0.31 is time-shared with panel DC and
+    // the panel owns it here. (Battery time-share comes with the render loop.)
+    let batt = (0u16, 0u16);
+    let _ = read_battery; // keep it compiled for the next milestone
 
     // OTA flash: the app's own Nvmc behind a Mutex, shared with per-connection
     // FirmwareUpdaters. from_linkerfile reads the __bootloader_dfu/state symbols.
@@ -341,6 +429,40 @@ async fn main(spawner: Spawner) {
             info!("[ota] previous update was REVERTED by the bootloader");
         }
         let _ = updater.mark_booted().await;
+    }
+
+    // Drive the panel: init + a 4-colour band test frame (embassy-nrf SPIM port of
+    // the proven JD79667 driver). The ~15s refresh is async, so the WDT-pet task
+    // keeps running. E-paper holds the image after, even once these pins drop.
+    {
+        let mut sc = spim::Config::default();
+        sc.frequency = spim::Frequency::M8;
+        let spi = Spim::new_txonly(p.TWISPI0, Irqs, p.P1_13, p.P1_15, sc);
+        let mut panel = Panel {
+            spi,
+            cs: Output::new(p.P1_12, Level::High, OutputDrive::Standard),
+            dc: Output::new(p.P0_31, Level::Low, OutputDrive::Standard),
+            rst: Output::new(p.P0_15, Level::High, OutputDrive::Standard),
+            busy: Input::new(p.P0_29, Pull::None),
+            en: Output::new(p.P1_11, Level::Low, OutputDrive::Standard),
+        };
+        let fb = unsafe { &mut *core::ptr::addr_of_mut!(PANEL_FB) };
+        for row in 0..PH {
+            let color = match row * 4 / PH {
+                0 => C_BLACK,
+                1 => C_WHITE,
+                2 => C_YELLOW,
+                _ => C_RED,
+            };
+            let byte = (color << 6) | (color << 4) | (color << 2) | color;
+            for c in 0..PROW {
+                fb[row * PROW + c] = byte;
+            }
+        }
+        panel.init().await;
+        let fb = unsafe { &*core::ptr::addr_of!(PANEL_FB) };
+        panel.push(fb).await;
+        info!("[panel] 4-band frame refreshed");
     }
 
     run(sdc, &nvmc, batt).await;
