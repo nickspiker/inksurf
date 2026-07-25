@@ -32,22 +32,34 @@ fn main() {
     .expect("write build_stamp.rs");
     println!("cargo::rerun-if-changed=../ota_key.bin");
 
-    // Decode the decimal font PNGs (0-9 then colon) into const bitmaps for the
-    // on-device now-time label. Each glyph = width + width*12 on/off bytes.
-    let names = ["0", "1", "2", "3", "4", "5", "6", "7", "8", "9", ":"];
+    // Decode the font PNGs into const bitmaps for the on-device labels. Each glyph
+    // = width + height + width*height on/off bytes. DIGITS = decimal 12px (0-9,
+    // colon); DOZENAL = Stelor-system 16px (Zil..Stelor = base-12 symbols 0..11).
     let mut font_src = String::from(
-        "pub const GLYPH_H: usize = 12;\npub const GLYPH_KERN: i32 = 1;\npub struct Glyph { pub w: u8, pub bits: &'static [u8] }\npub static DIGITS: [Glyph; 11] = [\n",
+        "pub const GLYPH_H: usize = 12;\npub const DOZENAL_H: usize = 16;\npub const GLYPH_KERN: i32 = 1;\npub struct Glyph { pub w: u8, pub h: u8, pub bits: &'static [u8] }\n",
     );
-    for n in names {
+    emit_font(&mut font_src, "DIGITS", &["0", "1", "2", "3", "4", "5", "6", "7", "8", "9", ":"], 12);
+    emit_font(
+        &mut font_src,
+        "DOZENAL",
+        &["Zil", "Zila", "Zilor", "Ter", "Tera", "Teror", "Lun", "Luna", "Lunor", "Stel", "Stela", "Stelor"],
+        16,
+    );
+    fs::write(out.join("font_glyphs.rs"), font_src).expect("write font_glyphs.rs");
+}
+
+/// Emit `pub static <name>: [Glyph; N]` from the named font PNGs (all `expect_h` tall).
+fn emit_font(src: &mut String, name: &str, glyphs: &[&str], expect_h: usize) {
+    src.push_str(&format!("pub static {name}: [Glyph; {}] = [\n", glyphs.len()));
+    for n in glyphs {
         let path = format!("../assets/font/{n}.png");
         println!("cargo::rerun-if-changed={path}");
         let (w, h, bits) = decode_png_file(&path);
-        assert_eq!(h, 12, "glyph {n} must be 12px tall");
+        assert_eq!(h, expect_h, "glyph {n} must be {expect_h}px tall");
         let bits_str = bits.iter().map(|b| b.to_string()).collect::<Vec<_>>().join(",");
-        font_src.push_str(&format!("    Glyph {{ w: {w}, bits: &[{bits_str}] }},\n"));
+        src.push_str(&format!("    Glyph {{ w: {w}, h: {h}, bits: &[{bits_str}] }},\n"));
     }
-    font_src.push_str("];\n");
-    fs::write(out.join("font_glyphs.rs"), font_src).expect("write font_glyphs.rs");
+    src.push_str("];\n");
 }
 
 /// Decode a font PNG to (width, height, on/off bytes) — "on" = brighter than mid-gray.

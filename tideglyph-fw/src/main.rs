@@ -508,7 +508,7 @@ fn local_hh_mm(unix: i64) -> (u32, u32) {
 
 fn blit_glyph(canvas: &mut [u8], g: &font::Glyph, left: i32, top: i32, color: u8) {
     let w = g.w as i32;
-    for gy in 0..font::GLYPH_H as i32 {
+    for gy in 0..g.h as i32 {
         let py = top + gy;
         if py < 0 || py >= CH as i32 {
             continue;
@@ -525,8 +525,32 @@ fn blit_glyph(canvas: &mut [u8], g: &font::Glyph, left: i32, top: i32, color: u8
     }
 }
 
+/// Wall-clock → (hi, lo) dozenal-symbol indices, rounded to the nearest 10-min
+/// mark: a 2-digit base-12 odometer of the day's 144 ten-minute marks. Wraps at
+/// midnight. Mirrors tide-display's dozenal_indices exactly.
+fn dozenal_indices(hh: u32, mm: u32) -> (usize, usize) {
+    let counter = ((hh * 60 + mm + 5) / 10) % 144;
+    ((counter / 12) as usize, (counter % 12) as usize)
+}
+
+/// Stamp the 2-symbol dozenal time around the now-line: hi's right edge at
+/// `anchor_x`, lo's left edge at `anchor_x + 1`, so the line shows through the gap.
+/// A trailing Zil (lo == 0) is dropped and the lone hi centres on the line — so
+/// midnight (Zil Zil) renders a single Zil sitting on it. Mirrors tide-display.
+fn draw_dozenal_label(canvas: &mut [u8], hi: usize, lo: usize, anchor_x: i32, top_y: i32, color: u8) {
+    let d = &font::DOZENAL;
+    if lo == 0 {
+        let g = &d[hi];
+        blit_glyph(canvas, g, anchor_x - g.w as i32 / 2, top_y, color);
+    } else {
+        blit_glyph(canvas, &d[hi], anchor_x - d[hi].w as i32, top_y, color);
+        blit_glyph(canvas, &d[lo], anchor_x + 1, top_y, color);
+    }
+}
+
 /// Stamp HH:MM with the colon centred on `pivot_x` (so it lands on the now-line),
 /// glyph tops at `top_y`. Mirrors tide-display's AlignChar(':') anchor.
+#[allow(dead_code)] // decimal mode kept available; the clock renders dozenal
 fn draw_time_hhmm(canvas: &mut [u8], hh: u32, mm: u32, pivot_x: i32, top_y: i32, color: u8) {
     let idx = [
         (hh / 10) as usize,
@@ -631,13 +655,14 @@ async fn render_tide(unix: i64, batt_mv: u16) {
             }
         }
     }
-    // "Now" line down the centre, split to leave a gap for the HH:MM time label,
-    // stamped so the colon sits right on the line.
+    // "Now" line down the centre, split to leave a gap for the dozenal time label,
+    // the two Stelor symbols straddling the line.
     let nx = (CW / 2) as i32;
-    let lbl_top = (CH as i32 - font::GLYPH_H as i32) / 2;
-    draw_v_line_split(canvas, nx, lbl_top - 2, font::GLYPH_H as i32 + 4, C_BLACK);
+    let lbl_top = (CH as i32 - font::DOZENAL_H as i32) / 2;
+    draw_v_line_split(canvas, nx, lbl_top - 2, font::DOZENAL_H as i32 + 4, C_BLACK);
     let (hh, mm) = local_hh_mm(unix);
-    draw_time_hhmm(canvas, hh, mm, nx, lbl_top, C_BLACK);
+    let (hi, lo) = dozenal_indices(hh, mm);
+    draw_dozenal_label(canvas, hi, lo, nx, lbl_top, C_BLACK);
     // Battery gauge, top-left: outlined bar filled proportional to STATE OF CHARGE
     // (remaining capacity), not raw voltage — so each pixel is roughly equal used
     // mAh. LiPo voltage-vs-capacity is very nonlinear (flat 3.7-3.9V plateau, steep
