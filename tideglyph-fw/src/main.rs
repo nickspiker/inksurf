@@ -810,16 +810,20 @@ async fn render_tide(unix: i64, batt_mv: u16) {
             canvas[yy * CW + x] = C_YELLOW;
         }
     }
-    // Hourly ticks (black, top + bottom edge); local midnight gets a taller 2px
-    // tick to anchor the day boundaries.
+    // Dozenal-hour ticks (black, top + bottom edge): one per DOZENAL hour = every
+    // 2 decimal hours (odd local hours dropped), local midnight taller (2px) to
+    // anchor the day boundaries. Matches the Pi's dozenal mode.
     for hh in -12..=12i32 {
         let x = (CW as f32 / 2.0 + hh as f32 * 3600.0 / 86400.0 * CW as f32) as i32;
         // Skip the outer 3 columns each side — reserved for the cycle indicators.
         if x >= 3 && x < CW as i32 - 3 {
-            let th = unix + hh as i64 * 3600;
-            let local_hour = (th + tz_offset_secs(th)).rem_euclid(86400) / 3600;
-            let th = if local_hour == 0 { 2 } else { 1 };
-            for dy in 0..th {
+            let tick_time = unix + hh as i64 * 3600;
+            let local_hour = (tick_time + tz_offset_secs(tick_time)).rem_euclid(86400) / 3600;
+            if local_hour % 2 != 0 {
+                continue; // odd hour — not a dozenal-hour boundary
+            }
+            let tick_h = if local_hour == 0 { 2 } else { 1 };
+            for dy in 0..tick_h {
                 canvas[dy as usize * CW + x as usize] = C_BLACK;
                 canvas[(CH - 1 - dy as usize) * CW + x as usize] = C_BLACK;
             }
@@ -1388,6 +1392,21 @@ async fn ota_session<P, DFU, STATE>(
                                 man_recv += n;
                             }
                             set_status(V_RECEIVING, img_recv);
+                            // Bitstream monitor: clock this packet's first 32-bit word
+                            // out the LED, ~1 ms/bit (MSB first), spread across the idle
+                            // inter-packet gap — a real ~1 kHz bit display, not one
+                            // sample/packet. img_recv is already updated so flow control
+                            // isn't paced; each await yields to BLE; and the ~32 ms fits
+                            // inside the ~57 ms packet period so throughput holds. 1 =
+                            // dim green (float), 0 = dark.
+                            if clen >= 4 {
+                                let word =
+                                    u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+                                for b in (0..32).rev() {
+                                    led((word >> b) & 1 == 1);
+                                    Timer::after(Duration::from_millis(1)).await;
+                                }
+                            }
                             event.accept_unprocessed()
                         } else if event.handle() == ctrl_h.handle {
                             let mut cb = [0u8; 8];
@@ -1403,7 +1422,7 @@ async fn ota_session<P, DFU, STATE>(
                                 man_recv = 0;
                                 info!("[ota] BEGIN image={} manifest={}", image_len, manifest_len);
                                 set_status(V_RECEIVING, 0);
-                                led(true); // dim "loading firmware" glow for the whole transfer
+                                led(true); // initial glow; the per-chunk bitstream flicker takes over as data flows
                             } else if cn >= 1 && cb[0] == 0x02 {
                                 // Reply to COMMIT FAST (status=verifying); do the heavy
                                 // verify AFTER the reply so the host's write doesn't time out.

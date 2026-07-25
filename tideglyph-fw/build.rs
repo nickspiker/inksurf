@@ -8,8 +8,11 @@ fn main() {
     let bytes = fs::read("memory.x").expect("read memory.x");
     fs::write(out.join("memory.x"), bytes).expect("write memory.x");
     println!("cargo::rustc-link-search={}", out.display());
-    println!("cargo::rerun-if-changed=memory.x");
-    println!("cargo::rerun-if-changed=build.rs");
+    // NOTE: deliberately emit NO `rerun-if-changed`. With any such directive, cargo
+    // re-runs build.rs only when those files change — so a main.rs-only edit left
+    // BUILD_UNIX_SECS/FIRMWARE_BUILD_STAMP frozen at the last build.rs run (it went
+    // ~14h stale, booting the clock into "yesterday"). With none, cargo re-runs
+    // build.rs whenever ANY package file changes, so every real build re-stamps.
     println!("cargo::rustc-link-arg-bins=--nmagic");
     println!("cargo::rustc-link-arg-bins=-Tlink.x");
     println!("cargo::rustc-link-arg-bins=-Tdefmt.x");
@@ -30,7 +33,6 @@ fn main() {
         format!("pub const FIRMWARE_BUILD_STAMP: i64 = {stamp};\npub const BUILD_UNIX_SECS: i64 = {unix};\n"),
     )
     .expect("write build_stamp.rs");
-    println!("cargo::rerun-if-changed=../ota_key.bin");
 
     // Decode the font PNGs into const bitmaps for the on-device labels. Each glyph
     // = width + height + width*height on/off bytes. DIGITS = decimal 12px (0-9,
@@ -53,7 +55,6 @@ fn emit_font(src: &mut String, name: &str, glyphs: &[&str], expect_h: usize) {
     src.push_str(&format!("pub static {name}: [Glyph; {}] = [\n", glyphs.len()));
     for n in glyphs {
         let path = format!("../assets/font/{n}.png");
-        println!("cargo::rerun-if-changed={path}");
         let (w, h, bits) = decode_png_file(&path);
         assert_eq!(h, expect_h, "glyph {n} must be {expect_h}px tall");
         let bits_str = bits.iter().map(|b| b.to_string()).collect::<Vec<_>>().join(",");
