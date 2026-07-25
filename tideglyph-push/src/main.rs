@@ -22,6 +22,7 @@ const CTRL: Uuid = Uuid::from_u128(0xb5f90002_2d5a_4f3c_9b1a_1d2e3f405060);
 const DATA: Uuid = Uuid::from_u128(0xb5f90003_2d5a_4f3c_9b1a_1d2e3f405060);
 const STATUS: Uuid = Uuid::from_u128(0xb5f90004_2d5a_4f3c_9b1a_1d2e3f405060);
 const BATTERY: Uuid = Uuid::from_u128(0xb5f90005_2d5a_4f3c_9b1a_1d2e3f405060);
+const TIME: Uuid = Uuid::from_u128(0xb5f90006_2d5a_4f3c_9b1a_1d2e3f405060);
 
 const BEGIN: u8 = 0x01;
 const COMMIT: u8 = 0x02;
@@ -69,8 +70,9 @@ async fn main() -> Result<()> {
         "manifest" => cmd_manifest(&image_path.context("usage: manifest <image.bin>")?),
         "push" => cmd_push(&image_path.context("usage: push <image.bin>")?).await,
         "battery" => cmd_battery().await,
+        "settime" => cmd_settime().await,
         _ => {
-            eprintln!("usage: tideglyph-push <manifest|push|battery> [image.bin]");
+            eprintln!("usage: tideglyph-push <manifest|push|battery|settime> [image.bin]");
             std::process::exit(2);
         }
     }
@@ -112,6 +114,35 @@ async fn cmd_battery() -> Result<()> {
     } else {
         println!("battery char returned {} bytes: {v:?}", v.len());
     }
+    Ok(())
+}
+
+async fn cmd_settime() -> Result<()> {
+    let central = Manager::new().await?.adapters().await?.into_iter().next().context("no BLE adapter")?;
+    let name = target_name();
+    println!("scanning for {name}…");
+    central.start_scan(ScanFilter::default()).await?;
+    let dev = 'f: {
+        for _ in 0..60 {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            for p in central.peripherals().await? {
+                if let Ok(Some(pr)) = p.properties().await {
+                    if pr.local_name.as_deref() == Some(name.as_str()) {
+                        break 'f p;
+                    }
+                }
+            }
+        }
+        return Err(anyhow!("{name} not found"));
+    };
+    central.stop_scan().await.ok();
+    dev.connect().await?;
+    dev.discover_services().await?;
+    let ch = dev.characteristics().into_iter().find(|c| c.uuid == TIME).context("no time char")?;
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs() as i64;
+    dev.write(&ch, &now.to_le_bytes(), WriteType::WithResponse).await?;
+    dev.disconnect().await.ok();
+    println!("set device clock to unix {now}");
     Ok(())
 }
 

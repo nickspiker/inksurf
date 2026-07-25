@@ -279,6 +279,8 @@ struct OtaService {
     /// count increments every refresh, so a reader can confirm the clock is ticking.
     #[characteristic(uuid = "b5f90005-2d5a-4f3c-9b1a-1d2e3f405060", read, value = [0u8; 6])]
     battery: [u8; 6],
+    #[characteristic(uuid = "b5f90006-2d5a-4f3c-9b1a-1d2e3f405060", write, value = [0u8; 8])]
+    time: [u8; 8],
 }
 
 const V_RECEIVING: u8 = 1;
@@ -639,6 +641,23 @@ fn pack(canvas: &[u8; CW * CH]) {
 /// Refresh cadence. 10 min = the design point for battery life.
 const REFRESH_SECS: u64 = 600;
 
+// Wall-clock epoch: unix seconds at uptime 0. 0 = fall back to the compile-time
+// build stamp (roughly right since build ≈ flash). Set precisely over BLE via the
+// time characteristic. u32 seconds is good through year 2106.
+static EPOCH_BASE: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+fn now_unix() -> i64 {
+    let base = EPOCH_BASE.load(core::sync::atomic::Ordering::Relaxed);
+    let base = if base == 0 { BUILD_UNIX_SECS } else { base as i64 };
+    base + embassy_time::Instant::now().as_secs() as i64
+}
+
+fn set_now(unix: i64) {
+    let uptime = embassy_time::Instant::now().as_secs() as i64;
+    // .max(1): never store 0, which is the "unset, use build stamp" sentinel.
+    EPOCH_BASE.store((unix - uptime).max(1) as u32, core::sync::atomic::Ordering::Relaxed);
+}
+
 /// The peripherals a refresh cycle needs. Held as masters; each cycle clones them
 /// (clone_unchecked) and uses them strictly sequentially (battery read fully done
 /// before the panel is built), so no two live handles ever touch the same pin.
@@ -789,7 +808,7 @@ async fn main(spawner: Spawner) {
         busy: p.P0_29,
         en: p.P1_11,
     };
-    let batt = do_refresh(&hw, BUILD_UNIX_SECS).await;
+    let batt = do_refresh(&hw, now_unix()).await;
     info!("[boot] self-test refresh OK, batt {} mV", batt.0);
 
     // Confirm the boot ONLY after the self-test refresh succeeded.
@@ -859,9 +878,14 @@ where
         async {
             let mut count = 0u16;
             loop {
-                Timer::after(Duration::from_secs(REFRESH_SECS)).await;
-                let now = BUILD_UNIX_SECS + embassy_time::Instant::now().as_secs() as i64;
-                let b = do_refresh(hw, now).await;
+                // Sleep to the next wall-clock 10-min mark (:00/:10/:20…) so the
+                // repaint lands on the mark and clock drift is visible as the
+                // refresh creeping off it. Recomputed each cycle, so a BLE time-set
+                // re-aligns immediately.
+                let now = now_unix();
+                let to_mark = REFRESH_SECS as i64 - now.rem_euclid(REFRESH_SECS as i64);
+                Timer::after(Duration::from_secs(to_mark as u64)).await;
+                let b = do_refresh(hw, now_unix()).await;
                 count = count.wrapping_add(1);
                 set_batt(b, count);
             }
@@ -936,6 +960,7 @@ async fn ota_session<P, DFU, STATE>(
     let ctrl_h = server.ota.ctrl;
     let data_h = server.ota.data;
     let status_ch = server.ota.status;
+    let time_h = server.ota.time;
 
     let mut image_len = 0u32;
     let mut manifest_len = 0usize;
@@ -1005,6 +1030,20 @@ async fn ota_session<P, DFU, STATE>(
                                 set_status(2, img_recv);
                                 led(false); // transfer done (verify/swap or reject next)
                                 commit_pending = true;
+                            }
+                            event.accept_unprocessed()
+                        } else if event.handle() == time_h.handle {
+                            // Set the wall clock: 8-byte little-endian unix seconds.
+                            let mut tb = [0u8; 8];
+                            let mut tn = 0usize;
+                            event.with_data(|_o, b| {
+                                tn = b.len().min(8);
+                                tb[..tn].copy_from_slice(&b[..tn]);
+                            });
+                            if tn >= 8 {
+                                let unix = i64::from_le_bytes(tb);
+                                set_now(unix);
+                                info!("[time] set unix={}", unix);
                             }
                             event.accept_unprocessed()
                         } else {
