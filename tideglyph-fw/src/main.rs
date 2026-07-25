@@ -548,6 +548,62 @@ fn draw_dozenal_label(canvas: &mut [u8], hi: usize, lo: usize, anchor_x: i32, to
     }
 }
 
+/// Stamp the dozenal time rotated 90° for a sunrise/sunset column: CCW reading
+/// bottom→top for sunrise, CW reading top→bottom for sunset, stacked and centred
+/// on (center_x, center_y). Each "on" pixel inverts what's beneath (reads against
+/// day or night). Trailing Zil dropped. Mirrors tide-display exactly.
+fn draw_dozenal_rotated_invert(
+    canvas: &mut [u8],
+    hi: usize,
+    lo: usize,
+    center_x: f32,
+    center_y: i32,
+    sunrise: bool,
+) {
+    let d = &font::DOZENAL;
+    let count: i32 = if lo == 0 { 1 } else { 2 };
+    let total_h: i32 = d[hi].w as i32
+        + if lo == 0 { 0 } else { d[lo].w as i32 }
+        + font::GLYPH_KERN * (count - 1).max(0);
+    let block_top = center_y - total_h / 2;
+    let rot_w = d[hi].h as i32;
+    let glyph_left = libm::ceilf(center_x) as i32 - rot_w / 2;
+    let mut cursor_bottom = block_top + total_h;
+    let mut cursor_top = block_top;
+    let mut draw_one = |g: &font::Glyph| {
+        let rot_h = g.w as i32;
+        let glyph_top = if sunrise { cursor_bottom - rot_h } else { cursor_top };
+        for src_y in 0..g.h as i32 {
+            for src_x in 0..g.w as i32 {
+                if g.bits[(src_y * g.w as i32 + src_x) as usize] == 0 {
+                    continue;
+                }
+                let (rx, ry) = if sunrise {
+                    (src_y, g.w as i32 - 1 - src_x)
+                } else {
+                    (g.h as i32 - 1 - src_y, src_x)
+                };
+                let px = glyph_left + rx;
+                let py = glyph_top + ry;
+                if px < 0 || px >= CW as i32 || py < 0 || py >= CH as i32 {
+                    continue;
+                }
+                let idx = py as usize * CW + px as usize;
+                canvas[idx] = invert_code(canvas[idx]);
+            }
+        }
+        if sunrise {
+            cursor_bottom -= rot_h + font::GLYPH_KERN;
+        } else {
+            cursor_top += rot_h + font::GLYPH_KERN;
+        }
+    };
+    draw_one(&d[hi]);
+    if lo != 0 {
+        draw_one(&d[lo]);
+    }
+}
+
 /// Stamp HH:MM with the colon centred on `pivot_x` (so it lands on the now-line),
 /// glyph tops at `top_y`. Mirrors tide-display's AlignChar(':') anchor.
 #[allow(dead_code)] // decimal mode kept available; the clock renders dozenal
@@ -710,6 +766,44 @@ async fn render_tide(unix: i64, batt_mv: u16) {
         let y = if moon_altitude_deg(unix + secs) > 0.0 { 0 } else { CH - 1 };
         let i = y * CW + x;
         canvas[i] = invert_code(canvas[i]);
+    }
+    // Sunrise/sunset rotated dozenal labels: scan the ±12h window for sun-altitude
+    // zero-crossings (same 0° threshold as the day/night invert, so each label sits
+    // exactly on the shading boundary), bisect to the crossing, and stamp the event
+    // time rotated. Drawn after the invert so night-column pixels double-invert back
+    // to day style. Rising crossing = sunrise, falling = sunset.
+    let mid_y = (CH / 2) as i32;
+    let mut prev_t = unix - 12 * 3600;
+    let mut prev_a = sun_altitude_deg(prev_t);
+    let mut t = prev_t + 600;
+    let mut n = 0u32;
+    while t <= unix + 12 * 3600 {
+        let a = sun_altitude_deg(t);
+        if (prev_a < 0.0) != (a < 0.0) {
+            let (mut lo_t, mut hi_t) = (prev_t, t);
+            for _ in 0..24 {
+                let m = (lo_t + hi_t) / 2;
+                if (sun_altitude_deg(m) < 0.0) == (prev_a < 0.0) {
+                    lo_t = m;
+                } else {
+                    hi_t = m;
+                }
+            }
+            let frac = (hi_t - unix) as f32 / 86400.0;
+            let xf = CW as f32 / 2.0 + frac * CW as f32;
+            if xf >= 0.0 && xf < CW as f32 {
+                let (lh, lm) = local_hh_mm(hi_t);
+                let (hi, lo) = dozenal_indices(lh, lm);
+                draw_dozenal_rotated_invert(canvas, hi, lo, xf, mid_y, a > prev_a);
+            }
+        }
+        prev_t = t;
+        prev_a = a;
+        t += 600;
+        n += 1;
+        if n % 32 == 0 {
+            embassy_futures::yield_now().await;
+        }
     }
     pack(canvas);
 }
