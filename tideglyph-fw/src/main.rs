@@ -713,12 +713,19 @@ async fn main(spawner: Spawner) {
     stage(1).await; // embassy init OK
 
     let mpsl_p = mpsl::Peripherals::new(p.RTC0, p.TIMER0, p.TEMP, p.PPI_CH19, p.PPI_CH30, p.PPI_CH31);
+    // LFCLK from the on-board 32.768 kHz CRYSTAL (~±20-50 ppm ≈ 2-4 s/day) instead
+    // of the internal RC (~±500 ppm ≈ 40 s/day) — this is the dominant drift lever,
+    // and embassy-time's RTC1 rides the same LFCLK so the whole clock benefits. If
+    // the crystal were unpopulated it wouldn't start; skip_wait=false blocks, the
+    // WDT isn't petted during MPSL init, so it just auto-reverts. rc_ctiv=0 (no RC
+    // calibration needed for a crystal). accuracy_ppm=50 = safe upper bound for BLE
+    // sleep-clock timing.
     let lfclk_cfg = mpsl::raw::mpsl_clock_lfclk_cfg_t {
-        source: mpsl::raw::MPSL_CLOCK_LF_SRC_RC as u8,
-        rc_ctiv: mpsl::raw::MPSL_RECOMMENDED_RC_CTIV as u8,
-        rc_temp_ctiv: mpsl::raw::MPSL_RECOMMENDED_RC_TEMP_CTIV as u8,
-        accuracy_ppm: mpsl::raw::MPSL_DEFAULT_CLOCK_ACCURACY_PPM as u16,
-        skip_wait_lfclk_started: mpsl::raw::MPSL_DEFAULT_SKIP_WAIT_LFCLK_STARTED != 0,
+        source: mpsl::raw::MPSL_CLOCK_LF_SRC_XTAL as u8,
+        rc_ctiv: 0,
+        rc_temp_ctiv: 0,
+        accuracy_ppm: 50,
+        skip_wait_lfclk_started: false,
     };
     static MPSL: StaticCell<MultiprotocolServiceLayer> = StaticCell::new();
     let mpsl = MPSL.init(unwrap!(mpsl::MultiprotocolServiceLayer::new(mpsl_p, Irqs, lfclk_cfg)));
