@@ -48,9 +48,11 @@ embedded-alloc = "0.6"
 tide-core = { path = "../tide-core" }
 libm = "0.2" # solar-altitude trig for the day/night invert
 
-# build.rs computes the Eagle-time build-stamp floor via vsf (std, host-side).
+# build.rs computes the Eagle-time build-stamp floor via vsf (std, host-side) and
+# decodes the font PNGs into const bitmaps (png, host-side).
 [build-dependencies]
 vsf = { path = "../../vsf" }
+png = "0.17"
 
 [patch.crates-io]
 nrf-sdc = { git = "https://github.com/alexmoon/nrf-sdc.git", rev = "abe49d22ebfc85fae134eb082fbfddf752016a55" }

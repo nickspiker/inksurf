@@ -493,9 +493,73 @@ fn interp(s: &[f32; N_SAMPLES], si: f32) -> f32 {
     s[i] + frac * (s[i + 1] - s[i])
 }
 
-/// Render a Bremerton tide chart centred on `unix` seconds into CANVAS, then
-/// pack into PANEL_FB. MVP: white bg, yellow tide-fill curve, black hourly ticks
-/// + a black "now" line down the centre. (Sun/moon/labels come later.)
+// Decimal bitmap font (0-9 then colon at index 10), decoded from PNGs at build time.
+mod font {
+    include!(concat!(env!("OUT_DIR"), "/font_glyphs.rs"));
+}
+
+// Bremerton is PDT (UTC-7) in summer. TODO: DST — winter (PST) would read 1h off.
+const TZ_OFFSET_SECS: i64 = -7 * 3600;
+
+fn local_hh_mm(unix: i64) -> (u32, u32) {
+    let sod = (unix + TZ_OFFSET_SECS).rem_euclid(86400);
+    ((sod / 3600) as u32, ((sod % 3600) / 60) as u32)
+}
+
+fn blit_glyph(canvas: &mut [u8], g: &font::Glyph, left: i32, top: i32, color: u8) {
+    let w = g.w as i32;
+    for gy in 0..font::GLYPH_H as i32 {
+        let py = top + gy;
+        if py < 0 || py >= CH as i32 {
+            continue;
+        }
+        for gx in 0..w {
+            let px = left + gx;
+            if px < 0 || px >= CW as i32 {
+                continue;
+            }
+            if g.bits[(gy * w + gx) as usize] != 0 {
+                canvas[py as usize * CW + px as usize] = color;
+            }
+        }
+    }
+}
+
+/// Stamp HH:MM with the colon centred on `pivot_x` (so it lands on the now-line),
+/// glyph tops at `top_y`. Mirrors tide-display's AlignChar(':') anchor.
+fn draw_time_hhmm(canvas: &mut [u8], hh: u32, mm: u32, pivot_x: i32, top_y: i32, color: u8) {
+    let idx = [
+        (hh / 10) as usize,
+        (hh % 10) as usize,
+        10,
+        (mm / 10) as usize,
+        (mm % 10) as usize,
+    ];
+    let d = &font::DIGITS;
+    let lead = d[idx[0]].w as i32 + font::GLYPH_KERN + d[idx[1]].w as i32 + font::GLYPH_KERN;
+    let mut cursor = pivot_x - lead - d[10].w as i32 / 2;
+    for &i in idx.iter() {
+        blit_glyph(canvas, &d[i], cursor, top_y, color);
+        cursor += d[i].w as i32 + font::GLYPH_KERN;
+    }
+}
+
+/// Vertical line down column `x`, skipping rows [gap_top, gap_top+gap_h) for a label.
+fn draw_v_line_split(canvas: &mut [u8], x: i32, gap_top: i32, gap_h: i32, color: u8) {
+    if x < 0 || x >= CW as i32 {
+        return;
+    }
+    let gap_end = gap_top + gap_h;
+    for y in 0..CH as i32 {
+        if y >= gap_top && y < gap_end {
+            continue;
+        }
+        canvas[y as usize * CW + x as usize] = color;
+    }
+}
+
+/// Render a Bremerton tide chart centred on `unix` seconds into CANVAS, then pack
+/// into PANEL_FB: tide-fill curve, hourly ticks (taller at local midnight), a
 /// State of charge (0..=1000 permille) of a single LiPo cell from its resting
 /// terminal voltage, via a piecewise-linear discharge LUT. Valid at rest/low load
 /// — which is our case: we sample right before a refresh after minutes idle, so
@@ -554,19 +618,26 @@ async fn render_tide(unix: i64, batt_mv: u16) {
             canvas[yy * CW + x] = C_YELLOW;
         }
     }
-    // Hourly ticks (black, top + bottom edge).
+    // Hourly ticks (black, top + bottom edge); local midnight gets a taller 2px
+    // tick to anchor the day boundaries.
     for hh in -12..=12i32 {
         let x = (CW as f32 / 2.0 + hh as f32 * 3600.0 / 86400.0 * CW as f32) as i32;
         if x >= 0 && x < CW as i32 {
-            canvas[x as usize] = C_BLACK;
-            canvas[(CH - 1) * CW + x as usize] = C_BLACK;
+            let local_hour = (unix + hh as i64 * 3600 + TZ_OFFSET_SECS).rem_euclid(86400) / 3600;
+            let th = if local_hour == 0 { 2 } else { 1 };
+            for dy in 0..th {
+                canvas[dy as usize * CW + x as usize] = C_BLACK;
+                canvas[(CH - 1 - dy as usize) * CW + x as usize] = C_BLACK;
+            }
         }
     }
-    // "Now" line, black, down the centre.
-    let nx = CW / 2;
-    for y in 0..CH {
-        canvas[y * CW + nx] = C_BLACK;
-    }
+    // "Now" line down the centre, split to leave a gap for the HH:MM time label,
+    // stamped so the colon sits right on the line.
+    let nx = (CW / 2) as i32;
+    let lbl_top = (CH as i32 - font::GLYPH_H as i32) / 2;
+    draw_v_line_split(canvas, nx, lbl_top - 2, font::GLYPH_H as i32 + 4, C_BLACK);
+    let (hh, mm) = local_hh_mm(unix);
+    draw_time_hhmm(canvas, hh, mm, nx, lbl_top, C_BLACK);
     // Battery gauge, top-left: outlined bar filled proportional to STATE OF CHARGE
     // (remaining capacity), not raw voltage — so each pixel is roughly equal used
     // mAh. LiPo voltage-vs-capacity is very nonlinear (flat 3.7-3.9V plateau, steep
