@@ -1244,13 +1244,16 @@ where
         async {
             let mut count = 0u16;
             loop {
-                // Sleep to the next wall-clock 10-min mark (:00/:10/:20…) so the
-                // repaint lands on the mark and clock drift is visible as the
-                // refresh creeping off it. If the clock is SET mid-sleep, bail via
-                // CLOCK_SET and recompute — otherwise the stale sleep would fire
-                // off-mark against the new clock.
+                // Repaint on the :05/:15/:25… boundaries, not :00/:10/:20. The
+                // dozenal readout rounds to the NEAREST 10-min mark, so its symbol
+                // flips at the half-step (:05) — repainting there keeps the panel
+                // always showing the current symbol (repainting on :00/:10 would
+                // show a stale symbol for the first 5 min of each interval). Drift
+                // still shows as the repaint creeping off the boundary. If the clock
+                // is SET mid-sleep, CLOCK_SET bails us out to recompute.
                 let now = now_unix();
-                let to_mark = REFRESH_SECS as i64 - now.rem_euclid(REFRESH_SECS as i64);
+                let phase = now.rem_euclid(REFRESH_SECS as i64); // secs past the :00 mark
+                let to_mark = if phase < 300 { 300 - phase } else { 900 - phase };
                 match embassy_futures::select::select(
                     Timer::after(Duration::from_secs(to_mark as u64)),
                     CLOCK_SET.wait(),
