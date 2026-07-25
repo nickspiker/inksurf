@@ -1015,6 +1015,11 @@ static CLOCK_SET: embassy_sync::signal::Signal<
     (),
 > = embassy_sync::signal::Signal::new();
 
+// True while an OTA transfer is live (BEGIN..COMMIT/disconnect). The refresh loop
+// skips repaints while set, so a multi-second render+panel-drive can't starve the
+// BLE transfer (or stomp the bitstream LED) mid-push.
+static OTA_ACTIVE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
 fn now_unix() -> i64 {
     let base = EPOCH_BASE.load(core::sync::atomic::Ordering::Relaxed);
     let base = if base == 0 { BUILD_UNIX_SECS } else { base as i64 };
@@ -1265,9 +1270,14 @@ where
                 .await
                 {
                     embassy_futures::select::Either::First(_) => {
-                        let b = do_refresh(hw, now_unix()).await;
-                        count = count.wrapping_add(1);
-                        set_batt(b, count);
+                        // Skip the repaint if an OTA is streaming — a multi-second
+                        // render+panel-drive would starve the transfer and stomp the
+                        // bitstream LED. The swap-boot self-test repaints anyway.
+                        if !OTA_ACTIVE.load(core::sync::atomic::Ordering::Relaxed) {
+                            let b = do_refresh(hw, now_unix()).await;
+                            count = count.wrapping_add(1);
+                            set_batt(b, count);
+                        }
                     }
                     // Clock was just set — loop to recompute to_mark against it.
                     embassy_futures::select::Either::Second(_) => {}
@@ -1363,7 +1373,10 @@ async fn ota_session<P, DFU, STATE>(
     let mut commit_pending = false;
     loop {
         match conn.next().await {
-            GattConnectionEvent::Disconnected { .. } => break,
+            GattConnectionEvent::Disconnected { .. } => {
+                OTA_ACTIVE.store(false, core::sync::atomic::Ordering::Relaxed); // transfer over — resume refreshes
+                break;
+            }
             GattConnectionEvent::Gatt { event } => {
                 let reply = match event {
                     GattEvent::Read(event) => event.accept(),
@@ -1422,6 +1435,7 @@ async fn ota_session<P, DFU, STATE>(
                                 man_recv = 0;
                                 info!("[ota] BEGIN image={} manifest={}", image_len, manifest_len);
                                 set_status(V_RECEIVING, 0);
+                                OTA_ACTIVE.store(true, core::sync::atomic::Ordering::Relaxed); // pause refreshes for the transfer
                                 led(true); // initial glow; the per-chunk bitstream flicker takes over as data flows
                             } else if cn >= 1 && cb[0] == 0x02 {
                                 // Reply to COMMIT FAST (status=verifying); do the heavy
