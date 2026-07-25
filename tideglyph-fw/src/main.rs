@@ -498,11 +498,51 @@ mod font {
     include!(concat!(env!("OUT_DIR"), "/font_glyphs.rs"));
 }
 
-// Bremerton is PDT (UTC-7) in summer. TODO: DST — winter (PST) would read 1h off.
-const TZ_OFFSET_SECS: i64 = -7 * 3600;
+// US Pacific local time, DST-aware. Pure integer calendar math (Howard Hinnant),
+// no_std — day-number ↔ civil date, then the US DST window.
+fn civil_from_days(z0: i64) -> (i64, u32, u32) {
+    let z = z0 + 719468;
+    let era = (if z >= 0 { z } else { z - 146096 }) / 146097;
+    let doe = z - era * 146097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let m = (if mp < 10 { mp + 3 } else { mp - 9 }) as u32;
+    (if m <= 2 { y + 1 } else { y }, m, d)
+}
+fn days_from_civil(y0: i64, m: u32, d: u32) -> i64 {
+    let y = if m <= 2 { y0 - 1 } else { y0 };
+    let era = (if y >= 0 { y } else { y - 399 }) / 400;
+    let yoe = y - era * 400;
+    let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) as i64 + 2) / 5 + (d as i64 - 1);
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146097 + doe - 719468
+}
+/// Unix seconds of `hour_utc` on the `n`th Sunday of `month` in `year`.
+fn nth_sunday_unix(year: i64, month: u32, n: i64, hour_utc: i64) -> i64 {
+    let first = days_from_civil(year, month, 1);
+    let wd = (first + 4).rem_euclid(7); // 0 = Sunday (1970-01-01 was Thursday)
+    let first_sunday_dom = 1 + ((7 - wd) % 7);
+    days_from_civil(year, month, (first_sunday_dom + 7 * (n - 1)) as u32) * 86400 + hour_utc * 3600
+}
+/// Pacific offset at `unix`: PDT (-7h) inside the US DST window (2nd Sun Mar 02:00
+/// → 1st Sun Nov 02:00 local), else PST (-8h). Host-verified vs the real 2025-27
+/// transition dates.
+fn tz_offset_secs(unix: i64) -> i64 {
+    let (year, _, _) = civil_from_days(unix.div_euclid(86400));
+    let dst_start = nth_sunday_unix(year, 3, 2, 10); // 02:00 PST = 10:00 UTC
+    let dst_end = nth_sunday_unix(year, 11, 1, 9); // 02:00 PDT = 09:00 UTC
+    if unix >= dst_start && unix < dst_end {
+        -7 * 3600
+    } else {
+        -8 * 3600
+    }
+}
 
 fn local_hh_mm(unix: i64) -> (u32, u32) {
-    let sod = (unix + TZ_OFFSET_SECS).rem_euclid(86400);
+    let sod = (unix + tz_offset_secs(unix)).rem_euclid(86400);
     ((sod / 3600) as u32, ((sod % 3600) / 60) as u32)
 }
 
@@ -776,12 +816,49 @@ async fn render_tide(unix: i64, batt_mv: u16) {
         let x = (CW as f32 / 2.0 + hh as f32 * 3600.0 / 86400.0 * CW as f32) as i32;
         // Skip the outer 3 columns each side — reserved for the cycle indicators.
         if x >= 3 && x < CW as i32 - 3 {
-            let local_hour = (unix + hh as i64 * 3600 + TZ_OFFSET_SECS).rem_euclid(86400) / 3600;
+            let th = unix + hh as i64 * 3600;
+            let local_hour = (th + tz_offset_secs(th)).rem_euclid(86400) / 3600;
             let th = if local_hour == 0 { 2 } else { 1 };
             for dy in 0..th {
                 canvas[dy as usize * CW + x as usize] = C_BLACK;
                 canvas[(CH - 1 - dy as usize) * CW + x as usize] = C_BLACK;
             }
+        }
+    }
+    // High/low tide markers (RED, pre-invert so they flip with day/night): a
+    // full-height red line at each curve extremum with the dozenal event time set
+    // OPPOSITE the curve — HIGH labels in the bottom third, LOW in the top third.
+    // Slope-flip detection with flat-run midpoint, matching tide-display.
+    let dh = font::DOZENAL_H as i32;
+    let top3 = (CH as i32 / 3 - dh) / 2;
+    let bot3 = CH as i32 - (CH as i32 / 3 + dh) / 2;
+    let mut prev_dir: i8 = 0;
+    let mut last_pivot = 0usize;
+    for i in 1..N_SAMPLES {
+        let (a, b) = (samples[i - 1], samples[i]);
+        let cur: i8 = if b > a {
+            1
+        } else if b < a {
+            -1
+        } else {
+            0
+        };
+        if cur != 0 {
+            if prev_dir != 0 && cur != prev_dir {
+                let is_high = prev_dir == 1;
+                let t = base + ((last_pivot + i - 1) / 2) as i64 * 360;
+                let frac = (t - unix) as f32 / 86400.0;
+                let ex = libm::roundf(CW as f32 / 2.0 + frac * CW as f32) as i32;
+                if ex >= 0 && ex < CW as i32 {
+                    let ly = if is_high { bot3 } else { top3 };
+                    draw_v_line_split(canvas, ex, ly - 2, dh + 4, C_RED);
+                    let (lh, lm) = local_hh_mm(t);
+                    let (hi, lo) = dozenal_indices(lh, lm);
+                    draw_dozenal_label(canvas, hi, lo, ex, ly, C_RED);
+                }
+            }
+            prev_dir = cur;
+            last_pivot = i;
         }
     }
     // "Now" line down the centre, split to leave a gap for the dozenal time label,
