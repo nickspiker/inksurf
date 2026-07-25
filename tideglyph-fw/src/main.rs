@@ -119,6 +119,7 @@ const P1_BASE: u32 = 0x5000_0300;
 const DIRSET: u32 = P1_BASE + 0x518;
 const OUTSET: u32 = P1_BASE + 0x508;
 const OUTCLR: u32 = P1_BASE + 0x50C;
+const DIRCLR: u32 = P1_BASE + 0x51C;
 const LED: u32 = 14;
 
 // Park the XIAO onboard RGB user LED (P0.26 R, P0.30 G, P0.06 B — active LOW) fully
@@ -138,19 +139,29 @@ fn park_rgb_leds() {
     }
 }
 
-// D9/P1.14 user LED (user-soldered, active-high): DRIVE IT OUTPUT-LOW so it's
-// definitively off — no drain, no glow. Leaving it a floating input was the bug:
-// a floating pin leaks enough to dimly light an active-high LED. Driving it low
-// (as the old boot code did between blinks) is why it read fully off before. Kept
-// off by default per the "no indication" request; led() stays a no-op so nothing
-// blinks it — trivially re-armable for diagnostics by having led() drive the pin.
+// D9/P1.14 user LED (user-soldered, active-high). Two states only, and "hot" (full
+// current) is electrically UNREACHABLE because we never drive the pin high:
+//   off  = OUTPUT LOW  → 0V across the LED, zero current, no glow.
+//   busy = INPUT/FLOAT → high-Z; the LED lights only from ~µA pin leakage, a
+//          ~100x-dimmer "doing something" glow. Input buffer stays disconnected
+//          (reset default) so float is pure leakage, not CMOS shoot-through.
+// The OUT latch is left at 0 forever — we only ever toggle DIR — so a bright/hot
+// drive cannot happen even by accident. led_init parks it OFF.
 fn led_init() {
     unsafe {
-        core::ptr::write_volatile(OUTCLR as *mut u32, 1 << LED); // OUT low first (no high glitch)
-        core::ptr::write_volatile(DIRSET as *mut u32, 1 << LED); // then make it an output
+        core::ptr::write_volatile(OUTCLR as *mut u32, 1 << LED); // OUT latch low (kept low forever)
+        core::ptr::write_volatile(DIRSET as *mut u32, 1 << LED); // output-low = off
     }
 }
-fn led(_on: bool) {}
+fn led(busy: bool) {
+    unsafe {
+        if busy {
+            core::ptr::write_volatile(DIRCLR as *mut u32, 1 << LED); // float = dim leakage glow
+        } else {
+            core::ptr::write_volatile(DIRSET as *mut u32, 1 << LED); // output-low = off (OUT still 0)
+        }
+    }
+}
 async fn stage(n: u32) {
     for _ in 0..n {
         led(true);
@@ -649,6 +660,7 @@ struct PanelHw {
 /// off. Returns the battery reading. This is BOTH the boot self-test and the loop
 /// body — if it survives the self-test, the loop can't crash.
 async fn do_refresh(hw: &PanelHw, now: i64) -> (u16, u16) {
+    led(true); // dim "busy" glow while we read battery + render + drive the panel
     let batt = read_battery(
         unsafe { hw.saadc.clone_unchecked() },
         unsafe { hw.ain.clone_unchecked() },
@@ -676,6 +688,7 @@ async fn do_refresh(hw: &PanelHw, now: i64) -> (u16, u16) {
     panel.init().await;
     let fb = unsafe { &*core::ptr::addr_of!(PANEL_FB) };
     panel.push(fb).await;
+    led(false); // done — back to fully off
     batt
 }
 
@@ -978,10 +991,12 @@ async fn ota_session<P, DFU, STATE>(
                                 man_recv = 0;
                                 info!("[ota] BEGIN image={} manifest={}", image_len, manifest_len);
                                 set_status(V_RECEIVING, 0);
+                                led(true); // dim "loading firmware" glow for the whole transfer
                             } else if cn >= 1 && cb[0] == 0x02 {
                                 // Reply to COMMIT FAST (status=verifying); do the heavy
                                 // verify AFTER the reply so the host's write doesn't time out.
                                 set_status(2, img_recv);
+                                led(false); // transfer done (verify/swap or reject next)
                                 commit_pending = true;
                             }
                             event.accept_unprocessed()
