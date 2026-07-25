@@ -1003,6 +1003,14 @@ const REFRESH_SECS: u64 = 600;
 // time characteristic. u32 seconds is good through year 2106.
 static EPOCH_BASE: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 
+// Signalled when the clock is set, so the refresh loop abandons its stale sleep
+// (scheduled against the old clock) and re-aligns to the NEW next 10-min mark —
+// otherwise the first refresh after a settime fires off-mark.
+static CLOCK_SET: embassy_sync::signal::Signal<
+    embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex,
+    (),
+> = embassy_sync::signal::Signal::new();
+
 fn now_unix() -> i64 {
     let base = EPOCH_BASE.load(core::sync::atomic::Ordering::Relaxed);
     let base = if base == 0 { BUILD_UNIX_SECS } else { base as i64 };
@@ -1013,6 +1021,7 @@ fn set_now(unix: i64) {
     let uptime = embassy_time::Instant::now().as_secs() as i64;
     // .max(1): never store 0, which is the "unset, use build stamp" sentinel.
     EPOCH_BASE.store((unix - uptime).max(1) as u32, core::sync::atomic::Ordering::Relaxed);
+    CLOCK_SET.signal(()); // wake the refresh loop to re-align to the new mark
 }
 
 /// The peripherals a refresh cycle needs. Held as masters; each cycle clones them
@@ -1237,14 +1246,25 @@ where
             loop {
                 // Sleep to the next wall-clock 10-min mark (:00/:10/:20…) so the
                 // repaint lands on the mark and clock drift is visible as the
-                // refresh creeping off it. Recomputed each cycle, so a BLE time-set
-                // re-aligns immediately.
+                // refresh creeping off it. If the clock is SET mid-sleep, bail via
+                // CLOCK_SET and recompute — otherwise the stale sleep would fire
+                // off-mark against the new clock.
                 let now = now_unix();
                 let to_mark = REFRESH_SECS as i64 - now.rem_euclid(REFRESH_SECS as i64);
-                Timer::after(Duration::from_secs(to_mark as u64)).await;
-                let b = do_refresh(hw, now_unix()).await;
-                count = count.wrapping_add(1);
-                set_batt(b, count);
+                match embassy_futures::select::select(
+                    Timer::after(Duration::from_secs(to_mark as u64)),
+                    CLOCK_SET.wait(),
+                )
+                .await
+                {
+                    embassy_futures::select::Either::First(_) => {
+                        let b = do_refresh(hw, now_unix()).await;
+                        count = count.wrapping_add(1);
+                        set_batt(b, count);
+                    }
+                    // Clock was just set — loop to recompute to_mark against it.
+                    embassy_futures::select::Either::Second(_) => {}
+                }
             }
         },
     )
