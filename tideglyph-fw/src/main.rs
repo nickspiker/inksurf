@@ -604,6 +604,78 @@ fn draw_dozenal_rotated_invert(
     }
 }
 
+// Cosmological-cycle edge indicators (left = moon phase, right = solar year).
+const NEW_MOON_REF_UNIX: i64 = 947_182_440; // 2000-01-06 18:14 UTC
+const SYNODIC_SECS: f64 = 29.530_588_853 * 86400.0;
+const WINTER_SOLSTICE_REF_UNIX: i64 = 1_734_772_860; // 2024-12-21 09:21 UTC
+const YEAR_SECS: f64 = 365.25 * 86400.0;
+const EVENT_WINDOW_SECS: f64 = 12.0 * 3600.0; // half-window for the "at extreme" bar
+
+#[derive(Copy, Clone)]
+enum CycleEventKind {
+    AtMin,
+    AtMax,
+    Rising,
+    Falling,
+}
+
+/// Fraction [0,1) of the cycle since the reference event (0 = new moon / solstice).
+fn cycle_phase(now_ts: i64, ref_unix: i64, cycle_secs: f64) -> f64 {
+    let p = (now_ts - ref_unix) as f64 / cycle_secs;
+    p - libm::floor(p)
+}
+
+fn cycle_event_kind(phase: f64, window_phase: f64) -> CycleEventKind {
+    if phase < window_phase || phase > 1.0 - window_phase {
+        CycleEventKind::AtMin
+    } else if libm::fabs(phase - 0.5) < window_phase {
+        CycleEventKind::AtMax
+    } else if phase < 0.5 {
+        CycleEventKind::Rising
+    } else {
+        CycleEventKind::Falling
+    }
+}
+
+/// Top of the 2px arrow from illuminated fraction — high (top) at full/bright.
+fn phase_to_arrow_y_top(phase: f64) -> i32 {
+    let illum = 0.5 * (1.0 - libm::cos(2.0 * core::f64::consts::PI * phase));
+    let y = libm::round((1.0 - illum) * (CH as f64 - 2.0)) as i32;
+    y.clamp(0, CH as i32 - 2)
+}
+
+/// 2px edge indicator: diagonal arrow (rising/falling) or a top/bottom bar (at
+/// max/min extreme), inverting what's beneath. left_side = moon (cols 0/1), else year.
+fn draw_cycle_indicator(canvas: &mut [u8], left_side: bool, kind: CycleEventKind, y_top: i32) {
+    let outer: i32 = if left_side { 0 } else { CW as i32 - 1 };
+    let inner: i32 = if left_side { 1 } else { CW as i32 - 2 };
+    let mut put = |x: i32, y: i32| {
+        if x < 0 || x >= CW as i32 || y < 0 || y >= CH as i32 {
+            return;
+        }
+        let i = y as usize * CW + x as usize;
+        canvas[i] = invert_code(canvas[i]);
+    };
+    match kind {
+        CycleEventKind::AtMin => {
+            put(outer, CH as i32 - 1);
+            put(inner, CH as i32 - 1);
+        }
+        CycleEventKind::AtMax => {
+            put(outer, 0);
+            put(inner, 0);
+        }
+        CycleEventKind::Rising => {
+            put(outer, y_top);
+            put(inner, y_top + 1);
+        }
+        CycleEventKind::Falling => {
+            put(inner, y_top);
+            put(outer, y_top + 1);
+        }
+    }
+}
+
 /// Stamp HH:MM with the colon centred on `pivot_x` (so it lands on the now-line),
 /// glyph tops at `top_y`. Mirrors tide-display's AlignChar(':') anchor.
 #[allow(dead_code)] // decimal mode kept available; the clock renders dozenal
@@ -702,7 +774,8 @@ async fn render_tide(unix: i64, batt_mv: u16) {
     // tick to anchor the day boundaries.
     for hh in -12..=12i32 {
         let x = (CW as f32 / 2.0 + hh as f32 * 3600.0 / 86400.0 * CW as f32) as i32;
-        if x >= 0 && x < CW as i32 {
+        // Skip the outer 3 columns each side — reserved for the cycle indicators.
+        if x >= 3 && x < CW as i32 - 3 {
             let local_hour = (unix + hh as i64 * 3600 + TZ_OFFSET_SECS).rem_euclid(86400) / 3600;
             let th = if local_hour == 0 { 2 } else { 1 };
             for dy in 0..th {
@@ -805,6 +878,23 @@ async fn render_tide(unix: i64, batt_mv: u16) {
             embassy_futures::yield_now().await;
         }
     }
+    // Moon-phase (left edge) + solar-year (right edge) cycle indicators: a 2px
+    // diagonal arrow whose height tracks illumination, or a top/bottom bar within
+    // 12h of the extreme (full/new moon, summer/winter solstice).
+    let moon_phase = cycle_phase(unix, NEW_MOON_REF_UNIX, SYNODIC_SECS);
+    let year_phase = cycle_phase(unix, WINTER_SOLSTICE_REF_UNIX, YEAR_SECS);
+    draw_cycle_indicator(
+        canvas,
+        true,
+        cycle_event_kind(moon_phase, EVENT_WINDOW_SECS / SYNODIC_SECS),
+        phase_to_arrow_y_top(moon_phase),
+    );
+    draw_cycle_indicator(
+        canvas,
+        false,
+        cycle_event_kind(year_phase, EVENT_WINDOW_SECS / YEAR_SECS),
+        phase_to_arrow_y_top(year_phase),
+    );
     pack(canvas);
 }
 
