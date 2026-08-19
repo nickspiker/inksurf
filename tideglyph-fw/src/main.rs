@@ -813,11 +813,17 @@ async fn render_tide(unix: i64, batt_mv: u16) {
     // Dozenal-hour ticks (black, top + bottom edge): one per DOZENAL hour = every
     // 2 decimal hours (odd local hours dropped), local midnight taller (2px) to
     // anchor the day boundaries. Matches the Pi's dozenal mode.
+    // Anchor to the current LOCAL hour boundary, not to `unix` — `unix` is almost
+    // never on the hour, so stepping from it would slide every tick right by the
+    // minutes-past-the-hour and, near an even/odd edge, drop a tick onto the
+    // now-line (reads as a full hour off). Mirrors tide-display, which truncates
+    // to the top of the local hour before stepping.
+    let hour0 = unix - (unix + tz_offset_secs(unix)).rem_euclid(3600);
     for hh in -12..=12i32 {
-        let x = (CW as f32 / 2.0 + hh as f32 * 3600.0 / 86400.0 * CW as f32) as i32;
+        let tick_time = hour0 + hh as i64 * 3600;
+        let x = (CW as f32 / 2.0 + (tick_time - unix) as f32 / 86400.0 * CW as f32) as i32;
         // Skip the outer 3 columns each side — reserved for the cycle indicators.
         if x >= 3 && x < CW as i32 - 3 {
-            let tick_time = unix + hh as i64 * 3600;
             let local_hour = (tick_time + tz_offset_secs(tick_time)).rem_euclid(86400) / 3600;
             if local_hour % 2 != 0 {
                 continue; // odd hour — not a dozenal-hour boundary
