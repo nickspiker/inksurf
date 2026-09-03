@@ -879,24 +879,21 @@ async fn render_tide(unix: i64, batt_mv: u16) {
     let (hh, mm) = local_hh_mm(unix);
     let (hi, lo) = dozenal_indices(hh, mm);
     draw_dozenal_label(canvas, hi, lo, nx, lbl_top, C_BLACK);
-    // Battery gauge, top-left: outlined bar filled proportional to STATE OF CHARGE
-    // (remaining capacity), not raw voltage — so each pixel is roughly equal used
-    // mAh. LiPo voltage-vs-capacity is very nonlinear (flat 3.7-3.9V plateau, steep
-    // ends), so a voltage bar reads full far too long then plummets.
-    const BW: usize = 40;
-    let level = (batt_soc_permille(batt_mv) as usize * (BW - 2) / 1000).min(BW - 2);
-    for x in 2..2 + BW {
-        canvas[2 * CW + x] = C_BLACK;
-        canvas[6 * CW + x] = C_BLACK;
-    }
-    for y in 2..=6 {
-        canvas[y * CW + 2] = C_BLACK;
-        canvas[y * CW + (1 + BW)] = C_BLACK;
-    }
-    for y in 3..6 {
-        for x in 3..3 + level {
-            canvas[y * CW + x] = C_BLACK;
-        }
+    // Battery gauge, top-left: a single dozenal digit for STATE OF CHARGE (remaining
+    // capacity, not raw voltage — LiPo voltage-vs-capacity is very nonlinear, so a
+    // voltage reading reads full far too long then plummets). Floor to twelfths: Zil
+    // (0) empty … Stelor (11) covers 11/12 up to just under full. A truly full pack
+    // (permille 1000 = 12/12) is "Zila Zil" — two glyphs — but only ever shows on the
+    // charger; on battery it always reads a single digit. Drawn pre-invert so it
+    // flips with the day/night column scheme like everything else.
+    let twelfths = (batt_soc_permille(batt_mv) as usize * 12 / 1000).min(12);
+    let (bx, by) = (2i32, 2i32);
+    if twelfths >= 12 {
+        let g = &font::DOZENAL[1]; // Zila
+        blit_glyph(canvas, g, bx, by, C_BLACK);
+        blit_glyph(canvas, &font::DOZENAL[0], bx + g.w as i32 + font::GLYPH_KERN, by, C_BLACK); // Zil
+    } else {
+        blit_glyph(canvas, &font::DOZENAL[twelfths], bx, by, C_BLACK);
     }
     // Day/night: invert every column where the sun is below the horizon, so the
     // whole night theme falls out of one pass. Yield periodically (many f64 trig
