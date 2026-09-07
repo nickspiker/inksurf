@@ -189,12 +189,14 @@ bind_interrupts!(struct Irqs {
     RTC0 => nrf_sdc::mpsl::HighPrioInterruptHandler;
 });
 
-// Battery-voltage calibration for the XIAO ONBOARD divider (~÷3) on AIN7/P0.31,
-// gated by VBAT_ENABLE (P0.14). Calibrated against a known 4.20V cell: raw = 1599,
-// so batt_mV = raw * 4200/1599. Linear through origin — the onboard tap is a clean
-// resistive divider on BAT+ (no board pull), so one point is enough.
-const BATT_CAL_NUM: u32 = 4200;
-const BATT_CAL_DEN: u32 = 1599;
+// Battery-voltage calibration for the divider on AIN7/P0.31, gated by VBAT_ENABLE
+// (P0.14). The PANEL unit's divider is NOT the ~÷3 of the bare XIAO (see the P0.31
+// integration note below): a bench voltmeter read 4.19V while the SAADC returned
+// raw 1396, i.e. ~÷3.42. Recalibrated to that point: batt_mV = raw * 4190/1396.
+// Linear through origin (clean resistive tap on BAT+, no board pull), one point
+// enough. If a unit reads off, re-measure BAT+ with a meter and update these.
+const BATT_CAL_NUM: u32 = 4190;
+const BATT_CAL_DEN: u32 = 1396;
 
 #[embassy_executor::task]
 async fn mpsl_task(mpsl: &'static MultiprotocolServiceLayer<'static>) -> ! {
@@ -879,22 +881,20 @@ async fn render_tide(unix: i64, batt_mv: u16) {
     let (hh, mm) = local_hh_mm(unix);
     let (hi, lo) = dozenal_indices(hh, mm);
     draw_dozenal_label(canvas, hi, lo, nx, lbl_top, C_BLACK);
-    // Battery gauge, top-left: a single dozenal digit for STATE OF CHARGE (remaining
-    // capacity, not raw voltage — LiPo voltage-vs-capacity is very nonlinear, so a
-    // voltage reading reads full far too long then plummets). Floor to twelfths: Zil
-    // (0) empty … Stelor (11) covers 11/12 up to just under full. A truly full pack
-    // (permille 1000 = 12/12) is "Zila Zil" — two glyphs — but only ever shows on the
-    // charger; on battery it always reads a single digit. Drawn pre-invert so it
-    // flips with the day/night column scheme like everything else.
-    let twelfths = (batt_soc_permille(batt_mv) as usize * 12 / 1000).min(12);
+    // Battery gauge, top-left: STATE OF CHARGE (remaining capacity, not raw voltage —
+    // LiPo voltage-vs-capacity is very nonlinear, so a voltage reading reads full far
+    // too long then plummets) as a two-digit dozenal FRACTION of full. Read it as
+    // "0.HiLo": ZilZil (0.00) = dead, StelorStelor (0.ЕЕ ≈ 143/144) = full. Always two
+    // glyphs — leading Zils are kept, unlike the time labels — so the gauge has a
+    // fixed footprint and a full pack can never collapse onto a bare "Zil". A true
+    // 1000‰ saturates to StelorStelor rather than carrying to Zila.ZilZil. Drawn
+    // pre-invert so it flips with the day/night column scheme like everything else.
+    let counter = (batt_soc_permille(batt_mv) as usize * 144 / 1000).min(143);
+    let (hi, lo) = (counter / 12, counter % 12);
     let (bx, by) = (2i32, 2i32);
-    if twelfths >= 12 {
-        let g = &font::DOZENAL[1]; // Zila
-        blit_glyph(canvas, g, bx, by, C_BLACK);
-        blit_glyph(canvas, &font::DOZENAL[0], bx + g.w as i32 + font::GLYPH_KERN, by, C_BLACK); // Zil
-    } else {
-        blit_glyph(canvas, &font::DOZENAL[twelfths], bx, by, C_BLACK);
-    }
+    let g_hi = &font::DOZENAL[hi];
+    blit_glyph(canvas, g_hi, bx, by, C_BLACK);
+    blit_glyph(canvas, &font::DOZENAL[lo], bx + g_hi.w as i32 + font::GLYPH_KERN, by, C_BLACK);
     // Day/night: invert every column where the sun is below the horizon, so the
     // whole night theme falls out of one pass. Yield periodically (many f64 trig
     // calls) so the WDT-pet task keeps running.
