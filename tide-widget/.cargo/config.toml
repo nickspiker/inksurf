@@ -1,0 +1,7 @@
+# The repo root's .cargo/config.toml forces thumbv6m (the RP2040 crate) for everything beneath it; this crate builds for the host (preview/tests) and Android (cargo ndk passes --target explicitly, which wins over this).
+[build]
+target = "x86_64-unknown-linux-gnu"
+
+# 16 KB page alignment: Android 15+ devices (Pixel 8 Pro on 16 flags it) refuse/warn on 4 KB-aligned LOAD segments, and NDK r25 links at 4 KB by default.
+[target.aarch64-linux-android]
+rustflags = ["-C", "link-arg=-Wl,-z,max-page-size=16384"]

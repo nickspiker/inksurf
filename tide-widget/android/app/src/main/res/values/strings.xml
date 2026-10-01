@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Tide</string>
+    <string name="widget_description">Bremerton tide chart, ±12 hours around now</string>
+</resources>
