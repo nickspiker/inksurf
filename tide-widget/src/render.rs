@@ -36,13 +36,23 @@ const SKY_SUN: u32 = 0xFFFF00; // sun up lights the sky's red + green channels
 const SKY_MOON: u32 = 0x0000FF; // moon up lights its blue channel — so: yellow day, white day with the moon up, blue moonlit night, black moonless night
 const STROKE: u32 = 0x000000; // every stroke and bar edge
 
+/// Vertical centre of Oxanium's digits and colon (half the 690-unit cap height), in font units; Arabic labels centre on this.
+const DIGIT_MID: f32 = 345.0;
+
+/// How times are written. Dozenal: two Stelor-system glyphs counting the day's 144 ten-minute marks, ticks every dozenal hour (2 decimal hours). Hourly: `HH:MM` in Arabic numerals with the colon on the bar, ticks every hour.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Edition {
+    Dozenal,
+    Hourly,
+}
+
 /// Render the chart centred on `unix` as row-major ARGB ints (Android's Bitmap int layout).
-pub fn render_argb(unix: i64, w: usize, h: usize) -> Vec<i32> {
-    render(unix, w.max(1), h.max(1)).into_iter().map(|p| p as i32).collect()
+pub fn render_argb(unix: i64, w: usize, h: usize, edition: Edition) -> Vec<i32> {
+    render(unix, w.max(1), h.max(1), edition).into_iter().map(|p| p as i32).collect()
 }
 
 /// Render the chart centred on `unix`: row-major visible ARGB, fully opaque.
-pub fn render(unix: i64, w: usize, h: usize) -> Vec<u32> {
+pub fn render(unix: i64, w: usize, h: usize, edition: Edition) -> Vec<u32> {
     let (wf, hf) = (w as f32, h as f32);
     let em = (0.09 * hf).max(16.0); // label size in px: the panel's 16px-of-180 proportion
     let k = em / UNITS_PER_EM; // font units → px
@@ -77,7 +87,7 @@ pub fn render(unix: i64, w: usize, h: usize) -> Vec<u32> {
             continue;
         }
         if prev_dir != 0 && cur != prev_dir {
-            let t = base + ((last_pivot + i - 1) / 2) as i64 * 360;
+            let t = refine_extremum(base + ((last_pivot + i - 1) / 2) as i64 * 360);
             let ex = wf / 2.0 + (t - unix) as f32 / 86400.0 * wf;
             if (0.0..wf).contains(&ex) {
                 extrema.push((ex, if prev_dir == 1 { hf * 2.0 / 3.0 } else { hf / 3.0 }, t));
@@ -97,21 +107,35 @@ pub fn render(unix: i64, w: usize, h: usize) -> Vec<u32> {
     };
 
     // 1. Labels, topmost and opaque: each glyph pixel is the solid fill beneath it (sky, or water below the surface) XOR the label's colour, composed at its coverage. Every later layer early-outs on those pixels, so no line, curve or stroke is ever painted under a glyph — the knockout falls out of topmost-first compositing with no mask or extra pass. Edge pixels take their coverage and leave the rest of the budget to whatever lies beside the glyph.
-    let (nh, nm) = local_hh_mm(unix);
-    let (hi, lo) = dozenal_indices(nh, nm);
-    let now_glyphs = straddle_paths(font, hi, lo, nx, mid_y, k);
+    // A time straddling a bar (dozenal: the two glyphs either side; hourly: HH:MM with the colon on it), and the same time rotated and top-aligned. Event times are exact; the now time is rounded to the nearest 10-minute mark in both editions, since the widget redraws every ten minutes.
+    let straddle = |hh: u32, mm: u32, line_x: f32, cy: f32| match edition {
+        Edition::Dozenal => {
+            let (hi, lo) = dozenal_indices(hh, mm);
+            straddle_paths(font, hi, lo, line_x, cy, k)
+        }
+        Edition::Hourly => colon_paths(font, &hhmm(hh, mm), line_x, cy, k),
+    };
+    let (nh, nm) = round_to_10(local_hh_mm(unix));
+    let now_glyphs = straddle(nh, nm, nx, mid_y);
     let mut tide_glyphs = Vec::new();
     for &(ex, cy, t) in &extrema {
         let (lh, lm) = local_hh_mm(t);
-        let (hi, lo) = dozenal_indices(lh, lm);
-        tide_glyphs.extend(straddle_paths(font, hi, lo, ex, cy, k));
+        tide_glyphs.extend(keep_inside(straddle(lh, lm, ex, cy), wf));
     }
     let mut sun_glyphs = Vec::new(); // rotated, on the seam, top-aligned clear of the midnight ticks
     let sun_top = (em * 0.2).max(6.0);
     for (xf, t, sunrise) in sun_crossings(unix, wf) {
         let (lh, lm) = local_hh_mm(t);
-        let (hi, lo) = dozenal_indices(lh, lm);
-        sun_glyphs.extend(rotated_paths(font, hi, lo, xf, sun_top, sunrise, k));
+        sun_glyphs.extend(keep_inside(
+            match edition {
+                Edition::Dozenal => {
+                    let (hi, lo) = dozenal_indices(lh, lm);
+                    rotated_paths(font, hi, lo, xf, sun_top, sunrise, k)
+                }
+                Edition::Hourly => rotated_text_paths(font, &hhmm(lh, lm), xf, sun_top, sunrise, k),
+            },
+            wf,
+        ));
     }
     // The solid fill at a pixel (sky, or water below the surface — water's share of the pixel row as the blend) XOR `ink`'s channels. XOR with 00/FF channels is affine, so XOR-then-blend equals blend-then-XOR.
     let fill_xor = |x: usize, y: usize, ink: u32| {
@@ -129,20 +153,20 @@ pub fn render(unix: i64, w: usize, h: usize) -> Vec<u32> {
     edged_vline(&mut f, nx, 0, g0, NOW_INK);
     edged_vline(&mut f, nx, g1, h as i32, NOW_INK);
 
-    // High/low tide bars, split around their labels.
+    // High/low tide bars, split around their labels. Bare 1px, no black edges.
     for &(ex, cy, _) in &extrema {
         let (g0, g1) = label_gap(cy);
-        edged_vline(&mut f, ex, 0, g0, TIDE_INK);
-        edged_vline(&mut f, ex, g1, h as i32, TIDE_INK);
+        vline(&mut f, ex, 0, g0, TIDE_INK);
+        vline(&mut f, ex, g1, h as i32, TIDE_INK);
     }
 
-    // Dozenal-hour ticks (top + bottom edge): every 2 decimal hours 2px tall, local midnight 4px. Anchored to the current local-hour boundary so they land on true hour marks.
+    // Ticks (top + bottom edge), 2px tall, local midnight 4px: every dozenal hour (2 decimal hours) in the dozenal edition, every hour in the hourly one. Anchored to the current local-hour boundary so they land on true hour marks.
     let hour0 = unix - (unix + tz_offset_secs(unix)).rem_euclid(3600);
     for hh in -12..=12i64 {
         let tick_time = hour0 + hh * 3600;
         let x = wf / 2.0 + (tick_time - unix) as f32 / 86400.0 * wf;
         let local_hour = (tick_time + tz_offset_secs(tick_time)).rem_euclid(86400) / 3600;
-        if x < 0.0 || x >= wf || local_hour % 2 != 0 {
+        if x < 0.0 || x >= wf || (edition == Edition::Dozenal && local_hour % 2 != 0) {
             continue;
         }
         let len = if local_hour == 0 { 4 } else { 2 };
@@ -309,7 +333,13 @@ fn mix(a: u32, b: u32, t: u32) -> u32 {
     ch(16) | ch(8) | ch(0)
 }
 
-/// 1px vertical bar in the pixel column containing `x`, rows y0..y1, then its 1px black edge on each side.
+/// Bare 1px vertical bar in the pixel column containing `x`, rows y0..y1 — no edges (the hi/lo bars).
+fn vline(f: &mut Frame, x: f32, y0: i32, y1: i32, hex: u32) {
+    let col = x.floor() as i32;
+    f.under_rect(col, y0, col + 1, y1, hex);
+}
+
+/// 1px vertical bar in the pixel column containing `x`, rows y0..y1, then its 1px black edge on each side (the now bar and the ticks).
 fn edged_vline(f: &mut Frame, x: f32, y0: i32, y1: i32, hex: u32) {
     if y1 <= y0 {
         return;
@@ -337,6 +367,21 @@ fn altitude_path(wf: f32, t_at: &dyn Fn(f32) -> i64, alt_y: &dyn Fn(f64) -> f32,
         x = (x + 2.0).min(wf);
     }
     pb.finish().unwrap()
+}
+
+/// Sharpen a high/low found on the 6-minute sample grid (good to ±3 min, and the grid moves with now, so the time would jitter between redraws) to the instant the tide's slope crosses zero: bisect a central-difference derivative of tide-core's prediction across ±12 min, to the second.
+fn refine_extremum(t0: i64) -> i64 {
+    let slope = |t: i64| tide_core::predict(tide_core::BREMERTON, (t + 30) as f64) - tide_core::predict(tide_core::BREMERTON, (t - 30) as f64);
+    let (mut a, mut b) = (t0 - 720, t0 + 720);
+    let sa = slope(a) > 0.0;
+    if sa == (slope(b) > 0.0) {
+        return t0; // no sign change in the bracket — keep the grid estimate
+    }
+    while b - a > 1 {
+        let m = (a + b) / 2;
+        if (slope(m) > 0.0) == sa { a = m } else { b = m }
+    }
+    (a + b) / 2
 }
 
 /// Sunrise/sunset in the ±12h window: (x, crossing time, is sunrise), where the sun's altitude crosses 0° (the seam), bisected to the second.
@@ -376,6 +421,7 @@ struct Glyph {
     path: Path,
     x_min: f32,
     x_max: f32,
+    adv: f32,
 }
 
 struct Builder(PathBuilder);
@@ -398,19 +444,31 @@ impl OutlineBuilder for Builder {
     }
 }
 
-/// Outline of dozenal digit `d` (0 = Zil … 11 = Stelor) in font units, y up.
-fn glyph(font: &Face, d: usize) -> Glyph {
-    let gid = font.glyph_index(char::from_u32(0x10 + d as u32).unwrap()).expect("dozenal glyph in font");
+/// Outline of character `c` in font units, y up, with its ink extent and advance.
+fn glyph_char(font: &Face, c: char) -> Glyph {
+    let gid = font.glyph_index(c).expect("glyph in font");
     let mut b = Builder(PathBuilder::new());
-    let bbox = font.outline_glyph(gid, &mut b).expect("dozenal glyph outline");
-    Glyph { path: b.0.finish().expect("glyph path"), x_min: bbox.x_min as f32, x_max: bbox.x_max as f32 }
+    let bbox = font.outline_glyph(gid, &mut b).expect("glyph outline");
+    let adv = font.glyph_hor_advance(gid).unwrap_or(0) as f32;
+    Glyph { path: b.0.finish().expect("glyph path"), x_min: bbox.x_min as f32, x_max: bbox.x_max as f32, adv }
 }
 
-/// Glyph `g` in pixel space, with its left ink edge and em-box centre at `anchor`, advancing along unit vector `u` with glyph-up along unit vector `v` (screen coords, y down), `k` px per font unit.
-fn place(g: &Glyph, anchor: (f32, f32), u: (f32, f32), v: (f32, f32), k: f32) -> Option<Path> {
-    let tx = anchor.0 - u.0 * k * g.x_min - v.0 * k * EM_MID;
-    let ty = anchor.1 - u.1 * k * g.x_min - v.1 * k * EM_MID;
+/// Outline of dozenal digit `d` (0 = Zil … 11 = Stelor).
+fn glyph(font: &Face, d: usize) -> Glyph {
+    glyph_char(font, char::from_u32(0x10 + d as u32).unwrap())
+}
+
+/// Glyph `g` in pixel space with font point (`rx`, `ry`) at `anchor`, advancing along unit vector `u` with glyph-up along unit vector `v` (screen coords, y down), `k` px per font unit.
+#[allow(clippy::too_many_arguments)]
+fn place_at(g: &Glyph, anchor: (f32, f32), u: (f32, f32), v: (f32, f32), k: f32, rx: f32, ry: f32) -> Option<Path> {
+    let tx = anchor.0 - u.0 * k * rx - v.0 * k * ry;
+    let ty = anchor.1 - u.1 * k * rx - v.1 * k * ry;
     g.path.clone().transform(Transform::from_row(u.0 * k, u.1 * k, v.0 * k, v.1 * k, tx, ty))
+}
+
+/// Dozenal glyph `g` with its left ink edge and em-box centre at `anchor`.
+fn place(g: &Glyph, anchor: (f32, f32), u: (f32, f32), v: (f32, f32), k: f32) -> Option<Path> {
+    place_at(g, anchor, u, v, k, g.x_min, EM_MID)
 }
 
 /// Two-symbol dozenal time straddling the 1px edged bar at `line_x`: hi ending just left of it, lo starting just right, centred on `cy`. A trailing Zil is dropped and the lone hi centres on the bar (midnight shows a single Zil), as on the panel.
@@ -442,6 +500,54 @@ fn rotated_paths(font: &Face, hi: usize, lo: usize, cx: f32, top: f32, sunrise: 
     out
 }
 
+/// Shift a label horizontally so its ink stays fully inside [1, w − 1]: a label on a bar near the edge slides off its bar rather than losing digits.
+fn keep_inside(paths: Vec<Path>, wf: f32) -> Vec<Path> {
+    let (l, r) = paths.iter().map(|p| p.bounds()).fold((f32::MAX, f32::MIN), |(l, r), b| (l.min(b.left()), r.max(b.right())));
+    let dx = if l < 1.0 { 1.0 - l } else if r > wf - 1.0 { (wf - 1.0 - r).max(1.0 - l) } else { 0.0 };
+    if dx == 0.0 {
+        return paths;
+    }
+    paths.into_iter().filter_map(|p| p.transform(Transform::from_translate(dx, 0.0))).collect()
+}
+
+/// "HH:MM", zero-padded 24-hour.
+fn hhmm(hh: u32, mm: u32) -> [char; 5] {
+    let d = |n: u32| char::from_digit(n, 10).unwrap();
+    [d(hh / 10), d(hh % 10), ':', d(mm / 10), d(mm % 10)]
+}
+
+/// A run of characters at the font's own advances: each glyph with its pen position (font units), plus the run's ink extent [first glyph's left ink edge, last glyph's right ink edge].
+fn text_run(font: &Face, text: &[char]) -> (Vec<(Glyph, f32)>, f32, f32) {
+    let mut pen = 0.0;
+    let mut run = Vec::with_capacity(text.len());
+    for &c in text {
+        let g = glyph_char(font, c);
+        let adv = g.adv;
+        run.push((g, pen));
+        pen += adv;
+    }
+    let ink0 = run.first().map_or(0.0, |(g, p)| p + g.x_min);
+    let ink1 = run.last().map_or(0.0, |(g, p)| p + g.x_max);
+    (run, ink0, ink1)
+}
+
+/// Arabic time straddling the bar at `line_x`: the colon's ink centred on the bar, digits either side at the font's advances, centred on `cy` — the panel's decimal-edition anchor.
+fn colon_paths(font: &Face, text: &[char], line_x: f32, cy: f32, k: f32) -> Vec<Path> {
+    let (run, _, _) = text_run(font, text);
+    let Some(i) = text.iter().position(|&c| c == ':') else { return Vec::new() };
+    let (colon, cp) = &run[i];
+    let c = cp + (colon.x_min + colon.x_max) / 2.0;
+    let centre = line_x.floor() + 0.5;
+    run.iter().filter_map(|(g, p)| place_at(g, (centre + (p - c) * k, cy), (1.0, 0.0), (0.0, -1.0), k, 0.0, DIGIT_MID)).collect()
+}
+
+/// Arabic time rotated 90° in the column at `cx`, its top ink end at `top`: sunrise reads bottom→top (CCW), sunset top→bottom (CW).
+fn rotated_text_paths(font: &Face, text: &[char], cx: f32, top: f32, sunrise: bool, k: f32) -> Vec<Path> {
+    let (run, ink0, ink1) = text_run(font, text);
+    let (u, v, origin) = if sunrise { ((0.0, -1.0), (-1.0, 0.0), (cx, top + ink1 * k)) } else { ((0.0, 1.0), (1.0, 0.0), (cx, top - ink0 * k)) };
+    run.iter().filter_map(|(g, p)| place_at(g, (origin.0 + u.0 * k * p, origin.1 + u.1 * k * p), u, v, k, 0.0, DIGIT_MID)).collect()
+}
+
 // ── Time, tide and sky math (shared with the panel firmware) ───────────────
 
 fn interp(s: &[f32; N_SAMPLES], si: f32) -> f32 {
@@ -454,6 +560,12 @@ fn interp(s: &[f32; N_SAMPLES], si: f32) -> f32 {
     let i = si as usize;
     let frac = si - i as f32;
     s[i] + frac * (s[i + 1] - s[i])
+}
+
+/// Wall-clock rounded to the nearest 10-minute mark (the same rounding the dozenal odometer uses), wrapping at midnight.
+fn round_to_10((hh, mm): (u32, u32)) -> (u32, u32) {
+    let counter = ((hh * 60 + mm + 5) / 10) % 144;
+    (counter / 6, counter % 6 * 10)
 }
 
 /// Wall-clock → (hi, lo) dozenal-symbol indices, rounded to the nearest 10-min mark: a 2-digit base-12 odometer of the day's 144 ten-minute marks.
@@ -583,10 +695,23 @@ mod tests {
         assert!((67.0..=72.0).contains(&moon), "moon max {moon}");
     }
 
+    /// A refined high/low doesn't move when it's sampled from a different grid phase (now shifted by a minute), unlike the raw 6-minute grid.
+    #[test]
+    fn refined_extremum_is_grid_independent() {
+        let slope = |t: i64| tide_core::predict(tide_core::BREMERTON, (t + 30) as f64) - tide_core::predict(tide_core::BREMERTON, (t - 30) as f64);
+        let mut t = 1_790_000_000; // walk the 6-minute grid to the next real high or low
+        while (slope(t) > 0.0) == (slope(t + 360) > 0.0) {
+            t += 360;
+        }
+        let (a, b, c) = (refine_extremum(t), refine_extremum(t + 200), refine_extremum(t - 150));
+        assert!((a - b).abs() <= 2 && (a - c).abs() <= 2, "{a} {b} {c}");
+        assert!((a - t).abs() <= 360, "refined {a} strayed from the grid bracket at {t}");
+    }
+
     /// The sky saturates α, so every pixel of a finished frame is opaque.
     #[test]
     fn frame_is_fully_opaque() {
-        let px = render(1_790_000_000, 384, 180);
+        let px = render(1_790_000_000, 384, 180, Edition::Dozenal);
         assert!(px.iter().all(|&p| p >> 24 == 0xFF));
     }
 }

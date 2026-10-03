@@ -19,10 +19,13 @@ import kotlin.math.max
 import kotlin.math.roundToInt
 
 /**
- * Renders each widget at its exact pixel size via Rust, writes a PNG, and points the launcher at it by URI.
- * Refresh: a self-re-arming alarm at every local :X5 (when the rounded dozenal label flips), plus resize, time/zone changes, boot, reinstall, and tap.
+ * Renders each widget at its exact pixel size via Rust, writes a PNG, and points the launcher at it by URI. This provider is the dozenal edition; [TideHourlyWidgetProvider] is the Arabic-numeral one, so the widget picker offers both.
+ * Refresh: one self-re-arming alarm at every local :X5 (when the now time's 10-minute rounding flips) redraws every placed widget of both editions, plus resize, time/zone changes, boot, reinstall, and tap.
  */
-class TideWidgetProvider : AppWidgetProvider() {
+open class TideWidgetProvider : AppWidgetProvider() {
+
+    /** Which edition this provider's widgets draw; [TideHourlyWidgetProvider] overrides it. */
+    protected open val hourly = false
 
     override fun onReceive(context: Context, intent: Intent) {
         when (intent.action) {
@@ -37,40 +40,48 @@ class TideWidgetProvider : AppWidgetProvider() {
     }
 
     override fun onUpdate(context: Context, appWidgetManager: AppWidgetManager, appWidgetIds: IntArray) {
-        appWidgetIds.forEach { update(context, appWidgetManager, it) }
+        appWidgetIds.forEach { update(context, appWidgetManager, it, hourly) }
         scheduleNext(context)
     }
 
     override fun onAppWidgetOptionsChanged(context: Context, appWidgetManager: AppWidgetManager, appWidgetId: Int, newOptions: Bundle) {
-        update(context, appWidgetManager, appWidgetId)
+        update(context, appWidgetManager, appWidgetId, hourly)
     }
 
     override fun onDeleted(context: Context, appWidgetIds: IntArray) {
         appWidgetIds.forEach { File(context.filesDir, pngName(it)).delete() }
     }
 
+    /** This edition's last widget is gone; stop the tick only if the other edition has none placed either. */
     override fun onDisabled(context: Context) {
-        context.getSystemService(AlarmManager::class.java).cancel(tickIntent(context))
+        if (placed(context).isEmpty()) context.getSystemService(AlarmManager::class.java).cancel(tickIntent(context))
     }
 
     companion object {
         const val ACTION_TICK = "com.inksurf.tide.TICK"
         private const val PERIOD_MS = 10 * 60_000L
-        private const val PHASE_MS = 5 * 60_000L // :X5 — when the nearest-10-min dozenal label flips
+        private const val PHASE_MS = 5 * 60_000L // :X5 — when the now time's nearest-10-minute rounding flips
 
         fun pngName(id: Int) = "tide_$id.png"
 
-        fun updateAll(ctx: Context) {
+        /** Every placed widget of both editions, as (widget id, hourly). */
+        private fun placed(ctx: Context): List<Pair<Int, Boolean>> {
             val mgr = AppWidgetManager.getInstance(ctx)
-            val ids = mgr.getAppWidgetIds(ComponentName(ctx, TideWidgetProvider::class.java))
-            ids.forEach { update(ctx, mgr, it) }
-            if (ids.isNotEmpty()) scheduleNext(ctx)
+            return listOf(TideWidgetProvider::class.java to false, TideHourlyWidgetProvider::class.java to true)
+                .flatMap { (cls, hourly) -> mgr.getAppWidgetIds(ComponentName(ctx, cls)).map { it to hourly } }
         }
 
-        fun update(ctx: Context, mgr: AppWidgetManager, id: Int) {
+        fun updateAll(ctx: Context) {
+            val mgr = AppWidgetManager.getInstance(ctx)
+            val all = placed(ctx)
+            all.forEach { (id, hourly) -> update(ctx, mgr, id, hourly) }
+            if (all.isNotEmpty()) scheduleNext(ctx)
+        }
+
+        fun update(ctx: Context, mgr: AppWidgetManager, id: Int, hourly: Boolean) {
             val (w, h) = widgetPx(ctx, mgr, id)
             val unix = System.currentTimeMillis() / 1000
-            val bmp = TideNative.bitmap(unix, w, h)
+            val bmp = TideNative.bitmap(unix, w, h, hourly)
             val file = File(ctx.filesDir, pngName(id))
             val tmp = File(ctx.filesDir, pngName(id) + ".tmp")
             tmp.outputStream().use { bmp.compress(Bitmap.CompressFormat.PNG, 100, it) }

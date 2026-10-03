@@ -13,17 +13,19 @@ import android.widget.ImageView
 import android.widget.LinearLayout
 import android.widget.TextView
 
-/** Bare-bones host screen: a full-width preview from the same renderer, how to add the widget, and the exact-alarm grant. Opening it also refreshes every placed widget and re-arms the tick. */
+/** Bare-bones host screen: full-width previews of both editions from the same renderer, how to add the widget, and the exact-alarm grant. Opening it also refreshes every placed widget and re-arms the tick. */
 class MainActivity : Activity() {
-    private lateinit var preview: ImageView
+    private lateinit var dozenal: ImageView
+    private lateinit var hourly: ImageView
     private lateinit var exactBtn: Button
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         val pad = (16 * resources.displayMetrics.density).toInt()
-        preview = ImageView(this).apply { adjustViewBounds = true }
+        dozenal = ImageView(this).apply { adjustViewBounds = true }
+        hourly = ImageView(this).apply { adjustViewBounds = true; setPadding(0, pad, 0, 0) }
         val hint = TextView(this).apply {
-            text = "Long-press the home screen → Widgets → Tide. Resize it to any size; it re-renders pixel-for-pixel."
+            text = "Long-press the home screen → Widgets → Tide, then pick dozenal or hourly (you can place both). Resize it to any size; it re-renders pixel-for-pixel."
             setPadding(0, pad, 0, pad)
         }
         exactBtn = Button(this).apply {
@@ -36,7 +38,8 @@ class MainActivity : Activity() {
             orientation = LinearLayout.VERTICAL
             gravity = Gravity.CENTER_HORIZONTAL
             setPadding(pad, pad * 3, pad, pad)
-            addView(preview)
+            addView(dozenal)
+            addView(hourly)
             addView(hint)
             addView(exactBtn)
         })
@@ -46,7 +49,9 @@ class MainActivity : Activity() {
         super.onResume()
         val w = resources.displayMetrics.widthPixels - 2 * (16 * resources.displayMetrics.density).toInt()
         val h = w * 180 / 384 // panel aspect
-        preview.setImageBitmap(TideNative.bitmap(System.currentTimeMillis() / 1000, w, h))
+        val unix = System.currentTimeMillis() / 1000
+        dozenal.setImageBitmap(TideNative.bitmap(unix, w, h, false))
+        hourly.setImageBitmap(TideNative.bitmap(unix, w, h, true))
         val exactOk = Build.VERSION.SDK_INT < Build.VERSION_CODES.S || getSystemService(AlarmManager::class.java).canScheduleExactAlarms()
         exactBtn.visibility = if (exactOk) Button.GONE else Button.VISIBLE
         TideWidgetProvider.updateAll(this)

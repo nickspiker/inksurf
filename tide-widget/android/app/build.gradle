@@ -37,9 +37,28 @@ android {
         }
     }
 
+    // Release signs with the canonical TOKEN key, like every one of Nick's Android apps (shared deterministic per-device ANDROID_ID). build.sh release resolves the keystore + password from the keys dir; a release build without them fails loud rather than producing a wrongly-signed APK. Debug builds never need them.
+    def tokenKsPath = System.getenv("TOKEN_KEYSTORE_PATH")
+    def tokenKsPass = System.getenv("TOKEN_KEYSTORE_PASSWORD")
+    def wantsRelease = gradle.startParameter.taskNames.any { it.toLowerCase().contains('release') }
+    if (wantsRelease && (!tokenKsPath || !tokenKsPass)) {
+        throw new GradleException("Release signing requires TOKEN_KEYSTORE_PATH and TOKEN_KEYSTORE_PASSWORD (the canonical 'token' key). Build with ./build.sh release.")
+    }
+    signingConfigs {
+        release {
+            if (tokenKsPath && tokenKsPass) {
+                storeFile file(tokenKsPath)
+                storePassword tokenKsPass
+                keyAlias System.getenv("TOKEN_KEY_ALIAS") ?: "token"
+                keyPassword System.getenv("TOKEN_KEY_PASSWORD") ?: tokenKsPass
+            }
+        }
+    }
+
     buildTypes {
         release {
             minifyEnabled false
+            if (tokenKsPath && tokenKsPass) signingConfig signingConfigs.release
         }
     }
 

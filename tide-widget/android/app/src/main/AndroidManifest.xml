@@ -20,9 +20,11 @@
             </intent-filter>
         </activity>
 
+        <!-- Dozenal edition. Also the receiver for the shared :X5 tick and the system time/boot broadcasts, which redraw both editions. -->
         <receiver
             android:name=".TideWidgetProvider"
-            android:exported="true">
+            android:exported="true"
+            android:label="@string/widget_dozenal">
             <intent-filter>
                 <action android:name="android.appwidget.action.APPWIDGET_UPDATE" />
                 <action android:name="android.intent.action.TIME_SET" />
@@ -34,6 +36,19 @@
             <meta-data
                 android:name="android.appwidget.provider"
                 android:resource="@xml/tide_widget_info" />
+        </receiver>
+
+        <!-- Hourly edition (Arabic numerals): a second entry in the widget picker; its refresh rides the dozenal receiver's tick. -->
+        <receiver
+            android:name=".TideHourlyWidgetProvider"
+            android:exported="true"
+            android:label="@string/widget_hourly">
+            <intent-filter>
+                <action android:name="android.appwidget.action.APPWIDGET_UPDATE" />
+            </intent-filter>
+            <meta-data
+                android:name="android.appwidget.provider"
+                android:resource="@xml/tide_hourly_widget_info" />
         </receiver>
 
         <!-- Serves each widget's rendered PNG to the launcher process by URI (sidesteps the RemoteViews bitmap size limit). Read-only; a tide chart is nothing secret. -->

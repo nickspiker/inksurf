@@ -1,5 +1,8 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
     <string name="app_name">Tide</string>
-    <string name="widget_description">Bremerton tide chart, ±12 hours around now</string>
+    <string name="widget_dozenal">Tide · dozenal</string>
+    <string name="widget_hourly">Tide · hourly</string>
+    <string name="widget_description">Bremerton tide, sun and moon, ±12 hours around now — dozenal times</string>
+    <string name="widget_hourly_description">Bremerton tide, sun and moon, ±12 hours around now — HH:MM times</string>
 </resources>
