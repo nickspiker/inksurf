@@ -162,11 +162,12 @@ pub fn render(unix: i64, w: usize, h: usize, edition: Edition) -> Vec<u32> {
         vline(&mut f, ex, g1, h as i32, TIDE_INK, &full);
     }
 
-    // Ticks (top + bottom edge) across the whole axis, 2px tall, local midnight 4px: every dozenal hour (2 decimal hours) in the dozenal edition, every hour in the hourly one, on true local hour marks. Each tick is a fixed span of time, one pixel's worth at the centre: near now it's a 1px tick, and further out it narrows with the axis, so the ruler keeps the same density of ink per unit of time instead of piling up. A column's coverage is the share of its time span under ticks (exact, no snapping, so a tick between two pixels splits across them), and the tick flips the pixel's channels by that share, blended in linear light.
+    // Ticks (top + bottom edge) across the whole axis, 2px tall; local midnight 6px tall and twice as wide, so the day boundaries stand out from the hour marks: every dozenal hour (2 decimal hours) in the dozenal edition, every hour in the hourly one, on true local hour marks. Each tick is a fixed span of time, one pixel's worth at the centre: near now it's a 1px tick, and further out it narrows with the axis, so the ruler keeps the same density of ink per unit of time instead of piling up. A column's coverage is the share of its time span under ticks (exact, no snapping, so a tick between two pixels splits across them), and the tick flips the pixel's channels by that share, blended in linear light.
     let step_hours = if edition == Edition::Dozenal { 2 } else { 1 };
     let tick_s = axis.t(wf / 2.0 + 0.5) - axis.t(wf / 2.0 - 0.5);
-    let coverage = |(a, b): (i64, i64), step: i64| {
-        let half = tick_s / 2;
+    // The share of a column's span [a, b) under ticks of `width` seconds centred on every `step`-hour mark.
+    let coverage = |(a, b): (i64, i64), step: i64, width: i64| {
+        let half = width / 2;
         let (mut sum, mut m) = (0, next_mark(a - half, step));
         while m - half < b {
             sum += (m + half).min(b) - (m - half).max(a);
@@ -175,8 +176,10 @@ pub fn render(unix: i64, w: usize, h: usize, edition: Edition) -> Vec<u32> {
         sum as f32 / (b - a) as f32
     };
     for x in 0..w {
-        let (marks, midnights) = (coverage(spans[x], step_hours), coverage(spans[x], 24));
-        for (rows, cover) in [(0..2, marks), (h - 2..h, marks), (2..4, midnights), (h - 4..h - 2, midnights)] {
+        // The top 2 rows: the hour marks, with each midnight's own 1px replaced by its 2px; rows 2 to 6: the midnights alone.
+        let midnights = coverage(spans[x], 24, 2 * tick_s);
+        let marks = coverage(spans[x], step_hours, tick_s) - coverage(spans[x], 24, tick_s) + midnights;
+        for (rows, cover) in [(0..2, marks), (h - 2..h, marks), (2..6, midnights), (h - 6..h - 2, midnights)] {
             if cover > 0.0 {
                 for y in rows {
                     let i = y * w + x;
