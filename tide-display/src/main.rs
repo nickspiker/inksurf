@@ -17,7 +17,7 @@ use std::sync::OnceLock;
 use std::time::Duration as StdDuration;
 
 // ============================================================================
-// Custom variable-width 12-px bitmap font. Each glyph is a separate PNG in /mnt/Octopus/Code/eink/assets/font/, embedded at compile time. Glyph height is uniform (12 px); width varies per glyph for proportional spacing.
+// Custom variable-width 12-px bitmap font. Each glyph is a separate PNG in /mnt/Harbor/Code/eink/assets/font/, embedded at compile time. Glyph height is uniform (12 px); width varies per glyph for proportional spacing.
 // ============================================================================
 
 struct Glyph {
