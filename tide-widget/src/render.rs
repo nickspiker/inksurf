@@ -1,12 +1,14 @@
 //! The panel's tide chart for a phone: full colour, anti-aliased, any pixel size.
 //!
-//! Same layout and data as the e-ink renderer (tideglyph-fw render_tide): ±12h window with now centred, tide fill on the fixed MLLW axis, dozenal-hour ticks, hi/lo markers with dozenal times, the now-line label, rotated sunrise/sunset times, and a hard day/night seam by sun altitude (plus a moon seam: the sun drives the sky's red + green, the moon its blue). Phone-specific: sun and moon altitude curves (horizon = the centreline, which is also mid-tide) instead of the panel's edge indicators, which rounded widget corners would clip; real glyph outlines from the dozenal font. Every line, edge and stroke is exactly 1px (the sun and moon curves 2px) at any widget size so it stays crisp; only the type scales. Colours are solid primaries for now, to be tuned.
+//! Same data as the e-ink renderer (tideglyph-fw render_tide), with now centred: tide fill on the fixed MLLW axis, dozenal-hour ticks, hi/lo markers with dozenal times, the now-line label, rotated sunrise/sunset times, and day/night by sun altitude (the sun drives the sky's red + green, the moon its blue). Phone-specific: a time axis that is nearly linear over the day around now (the centre half of the width) and tapers like a circle's edge out to half a year either side ([`TimeAxis`]); sun and moon altitude curves (horizon = the centreline, which is also mid-tide) instead of the panel's edge indicators, which rounded widget corners would clip; real glyph outlines from the dozenal font.
+//!
+//! Sky, water, waterline and the curves are drawn as vertical slices, one per sample instant, averaged per pixel column in linear light ([`column`]): no stroked paths, so near now they are crisp and out where a column spans weeks they become the tide's density and the curves' glow. Lines (the hi/lo bars, ticks and centreline) flip the channels their colour carries in the finished pixel, so they show on any fill; the now bar stays solid white with black edges, and the labels flip the fill beneath them. Every overlay is a fixed number of pixels at any widget size; only the type scales. Colours are solid primaries for now, to be tuned.
 //!
 //! Compositing is fluor-style, not Porter-Duff over: the frame starts empty in fluor's α + darkness format and is built topmost-first, each layer composed UNDER the running composite with fluor's `Blend::under` kernel (Normal mode, mirrored below — fluor's no-default-features build doesn't currently compile, so it isn't a dependency yet). Draw order, top to bottom: labels; now bar; hi/lo bars; ticks; sun curve, its stroke; moon curve, its stroke; centreline; water stroke; water fill; sky (one pass over whatever is still transparent). Labels have no stroke: each glyph pixel is the solid fill beneath it XOR the label's colour (now time: all three channels; tide times: green + blue; sunrise/sunset: red + green), so it always contrasts — and since labels go down first and opaque, every later layer early-outs under them: no line or curve is ever painted beneath type. tiny-skia only rasterizes anti-aliased coverage masks; one `^ 0x00FFFFFF` at the end flips darkness back to visible RGB.
 
 use std::sync::OnceLock;
 
-use tiny_skia::{FillRule, LineCap, LineJoin, Mask, Path, PathBuilder, Stroke, Transform};
+use tiny_skia::{FillRule, Mask, Path, PathBuilder, Transform};
 use ttf_parser::{Face, OutlineBuilder};
 
 /// Oxanium Regular + the twelve dozenal glyphs (Zil..Stelor) at U+0010..U+001B.
@@ -57,17 +59,26 @@ pub fn render(unix: i64, w: usize, h: usize, edition: Edition) -> Vec<u32> {
     let em = (0.09 * hf).max(16.0); // label size in px: the panel's 16px-of-180 proportion
     let k = em / UNITS_PER_EM; // font units → px
     let (nx, mid_y) = ((w / 2) as f32, hf / 2.0);
-    let t_at = |x: f32| unix + ((x - wf / 2.0) / wf * 86400.0) as i64;
+    let axis = TimeAxis::new(unix, wf);
+    // The span of time each pixel column covers: minutes near now, months at the edges.
+    let spans: Vec<(i64, i64)> = (0..w).map(|x| (axis.t(x as f32), axis.t(x as f32 + 1.0))).collect();
 
-    // Day/night: hard seam per pixel column by sun altitude at the column's time. The sky colour is additive per column — the sun owns red + green, the moon owns blue — so moonrise/moonset are hard seams too.
-    let night: Vec<bool> = (0..w).map(|x| sun_altitude_deg(t_at(x as f32 + 0.5)) < 0.0).collect();
-    let sky: Vec<u32> = (0..w)
-        .map(|x| {
-            let moon_up = moon_altitude_deg(t_at(x as f32 + 0.5)) > 0.0;
-            (if night[x] { 0 } else { SKY_SUN }) | (if moon_up { SKY_MOON } else { 0 })
-        })
-        .collect();
-    let mut f = Frame::new(w, h, night);
+    // Each body's highest altitude over the surrounding year, for its curve's full height (horizon on the centreline).
+    let maxes = (yearly_max_altitude(unix, sun_altitude_deg), yearly_max_altitude(unix, moon_altitude_deg));
+    // Sky and water, each column the average of its instants: see `column`. `fill` is the sky and water alone (what labels knock out of), `full` adds the waterline stroke.
+    let mut fill = vec![0u32; w * h];
+    let mut full = vec![0u32; w * h];
+    for x in 0..w {
+        let c = column(spans[x], h, unix as u64 ^ (x as u64) << 32, maxes);
+        for y in 0..h {
+            (fill[y * w + x], full[y * w + x]) = (c.fill[y], c.full[y]);
+        }
+    }
+    // Centreline: mid-tide on the fixed axis, and the horizon for the curves. 1px, every channel of the finished pixel flipped (like the bars, which are drawn against this so a crossing flips both).
+    for x in 0..w {
+        full[h / 2 * w + x] ^= 0xFF_FFFF;
+    }
+    let mut f = Frame::new(w, h);
 
     // Tide: 241 samples over ±12h, MLLW feet.
     let mut samples = [0f32; N_SAMPLES];
@@ -88,7 +99,7 @@ pub fn render(unix: i64, w: usize, h: usize, edition: Edition) -> Vec<u32> {
         }
         if prev_dir != 0 && cur != prev_dir {
             let t = refine_extremum(base + ((last_pivot + i - 1) / 2) as i64 * 360);
-            let ex = wf / 2.0 + (t - unix) as f32 / 86400.0 * wf;
+            let ex = axis.x(t);
             if (0.0..wf).contains(&ex) {
                 extrema.push((ex, if prev_dir == 1 { hf * 2.0 / 3.0 } else { hf / 3.0 }, t));
             }
@@ -99,12 +110,6 @@ pub fn render(unix: i64, w: usize, h: usize, edition: Edition) -> Vec<u32> {
     let label_gap = |cy: f32| ((cy - em / 2.0 - em * 0.15) as i32, (cy + em / 2.0 + em * 0.15).ceil() as i32);
     let font = face();
 
-    // Water surface y at any x (the tide curve on the fixed MLLW axis).
-    let tide_y = |x: f32| {
-        let si = (x / wf * 86400.0) / 360.0;
-        let tt = ((interp(&samples, si) - TIDE_MIN_FT) / (TIDE_MAX_FT - TIDE_MIN_FT)).clamp(0.0, 1.0);
-        hf * (1.0 - tt)
-    };
 
     // 1. Labels, topmost and opaque: each glyph pixel is the solid fill beneath it (sky, or water below the surface) XOR the label's colour, composed at its coverage. Every later layer early-outs on those pixels, so no line, curve or stroke is ever painted under a glyph — the knockout falls out of topmost-first compositing with no mask or extra pass. Edge pixels take their coverage and leave the rest of the budget to whatever lies beside the glyph.
     // A time straddling a bar (dozenal: the two glyphs either side; hourly: HH:MM with the colon on it), and the same time rotated and top-aligned. Event times are exact; the now time is rounded to the nearest 10-minute mark in both editions, since the widget redraws every ten minutes.
@@ -124,7 +129,7 @@ pub fn render(unix: i64, w: usize, h: usize, edition: Edition) -> Vec<u32> {
     }
     let mut sun_glyphs = Vec::new(); // rotated, on the seam, top-aligned clear of the midnight ticks
     let sun_top = (em * 0.2).max(6.0);
-    for (xf, t, sunrise) in sun_crossings(unix, wf) {
+    for (xf, t, sunrise) in sun_crossings(&axis) {
         let (lh, lm) = local_hh_mm(t);
         sun_glyphs.extend(keep_inside(
             match edition {
@@ -137,11 +142,8 @@ pub fn render(unix: i64, w: usize, h: usize, edition: Edition) -> Vec<u32> {
             wf,
         ));
     }
-    // The solid fill at a pixel (sky, or water below the surface — water's share of the pixel row as the blend) XOR `ink`'s channels. XOR with 00/FF channels is affine, so XOR-then-blend equals blend-then-XOR.
-    let fill_xor = |x: usize, y: usize, ink: u32| {
-        let wc = (((y as f32 + 1.0) - tide_y(x as f32 + 0.5)).clamp(0.0, 1.0) * 255.0) as u32;
-        mix(sky[x] ^ ink, WATER ^ ink, wc)
-    };
+    // The fill at a pixel (sky and water, without the waterline stroke) XOR `ink`'s channels.
+    let fill_xor = |x: usize, y: usize, ink: u32| fill[y * w + x] ^ ink;
     for (glyphs, ink) in [(&now_glyphs, NOW_INK), (&tide_glyphs, TIDE_INK), (&sun_glyphs, SUN_INK)] {
         for g in glyphs {
             f.under_path_with(g, |x, y| fill_xor(x, y, ink));
@@ -156,63 +158,194 @@ pub fn render(unix: i64, w: usize, h: usize, edition: Edition) -> Vec<u32> {
     // High/low tide bars, split around their labels. Bare 1px, no black edges.
     for &(ex, cy, _) in &extrema {
         let (g0, g1) = label_gap(cy);
-        vline(&mut f, ex, 0, g0, TIDE_INK);
-        vline(&mut f, ex, g1, h as i32, TIDE_INK);
+        vline(&mut f, ex, 0, g0, TIDE_INK, &full);
+        vline(&mut f, ex, g1, h as i32, TIDE_INK, &full);
     }
 
-    // Ticks (top + bottom edge), 2px tall, local midnight 4px: every dozenal hour (2 decimal hours) in the dozenal edition, every hour in the hourly one. Anchored to the current local-hour boundary so they land on true hour marks.
-    let hour0 = unix - (unix + tz_offset_secs(unix)).rem_euclid(3600);
-    for hh in -12..=12i64 {
-        let tick_time = hour0 + hh * 3600;
-        let x = wf / 2.0 + (tick_time - unix) as f32 / 86400.0 * wf;
-        let local_hour = (tick_time + tz_offset_secs(tick_time)).rem_euclid(86400) / 3600;
-        if x < 0.0 || x >= wf || (edition == Edition::Dozenal && local_hour % 2 != 0) {
-            continue;
+    // Ticks (top + bottom edge) across the whole axis, 2px tall, local midnight 4px: every dozenal hour (2 decimal hours) in the dozenal edition, every hour in the hourly one, on true local hour marks. Each tick is a fixed span of time, one pixel's worth at the centre: near now it's a 1px tick, and further out it narrows with the axis, so the ruler keeps the same density of ink per unit of time instead of piling up. A column's coverage is the share of its time span under ticks (exact, no snapping, so a tick between two pixels splits across them), and the tick flips the pixel's channels by that share, blended in linear light.
+    let step_hours = if edition == Edition::Dozenal { 2 } else { 1 };
+    let tick_s = axis.t(wf / 2.0 + 0.5) - axis.t(wf / 2.0 - 0.5);
+    let coverage = |(a, b): (i64, i64), step: i64| {
+        let half = tick_s / 2;
+        let (mut sum, mut m) = (0, next_mark(a - half, step));
+        while m - half < b {
+            sum += (m + half).min(b) - (m - half).max(a);
+            m = next_mark(m + 1, step);
         }
-        let len = if local_hour == 0 { 4 } else { 2 };
-        edged_vline(&mut f, x, 0, len, TICK);
-        edged_vline(&mut f, x, h as i32 - len, h as i32, TICK);
-    }
-
-    // Sun curve, its stroke; moon curve, its stroke. Horizon on the centreline; each body's highest altitude over the surrounding year at the top edge (its lowest, the mirror image, at the bottom).
-    let span = |max: f64| move |a: f64| mid_y - (a / max) as f32 * (mid_y - 1.0);
-    let sun_curve = altitude_path(wf, &t_at, &span(yearly_max_altitude(unix, sun_altitude_deg)), sun_altitude_deg);
-    f.curve_then_stroke(&sun_curve, SUN);
-    let moon_curve = altitude_path(wf, &t_at, &span(yearly_max_altitude(unix, moon_altitude_deg)), moon_altitude_deg);
-    f.curve_then_stroke(&moon_curve, MOON);
-
-    // Centreline: mid-tide on the fixed axis, and the horizon for the curves. 1px, the fill beneath XOR all three channels.
-    let mid_row = h / 2;
+        sum as f32 / (b - a) as f32
+    };
     for x in 0..w {
-        f.under(mid_row * w + x, fill_xor(x, mid_row, 0xFFFFFF), 255);
-    }
-
-    // Water stroke (1px along the surface), then the water fill from the curve down.
-    let mut surface = PathBuilder::new();
-    let mut x = 0.0;
-    loop {
-        if x == 0.0 { surface.move_to(x, tide_y(x)) } else { surface.line_to(x, tide_y(x)) }
-        if x >= wf {
-            break;
+        let (marks, midnights) = (coverage(spans[x], step_hours), coverage(spans[x], 24));
+        for (rows, cover) in [(0..2, marks), (h - 2..h, marks), (2..4, midnights), (h - 4..h - 2, midnights)] {
+            if cover > 0.0 {
+                for y in rows {
+                    let i = y * w + x;
+                    let (base, flipped) = (linear(full[i]), linear(full[i] ^ TICK));
+                    f.under(i, encode(core::array::from_fn(|c| base[c] + (flipped[c] - base[c]) * cover.min(1.0))), 255);
+                }
+            }
         }
-        x = (x + 2.0).min(wf);
     }
-    let surface = surface.finish().unwrap();
-    if let Some(s) = stroked(&surface, 1.0) {
-        f.under_path(&s, STROKE, STROKE);
-    }
-    let mut water = PathBuilder::new();
-    water.move_to(0.0, hf);
-    for p in surface.points() {
-        water.line_to(p.x, p.y);
-    }
-    water.line_to(wf, hf);
-    water.close();
-    f.under_path(&water.finish().unwrap(), WATER, WATER);
 
-    // Sky: one pass over everything still not opaque.
-    f.under_fill(&sky);
+    // Sky, water, waterline, the sun and moon curves and the centreline: one opaque pass under everything still not opaque.
+    for (i, &c) in full.iter().enumerate() {
+        f.under(i, c, 255);
+    }
     f.finish()
+}
+
+// ── Time axis ───────────────────────────────────────────────────────────────
+
+/// The day either side of now across the centre half of the width.
+const CENTRE_HALF_S: f64 = 12.0 * 3600.0;
+/// Half a year either side at the edges.
+const EDGE_S: f64 = 182.5 * 86400.0;
+
+/// The horizontal time axis: nearly linear around now, tapering like the edge of a circle so the edges reach half a year out. With u = −1..1 across the width, t − now = k·u / √(c − u²): the slope of a circle of radius √c, steepening without end as u nears the rim, with the offset c − 1 > 0 keeping the rim itself finite. The two constraints (t = ±12 h at u = ±½, ±182.5 days at u = ±1) fix both constants in closed form: with R = 182.5 days / 12 h = 365, c = (R² − 1) / (R² − 4) and k = 2 · 12 h · √(c − ¼).
+struct TimeAxis {
+    now: i64,
+    half_w: f32,
+    k: f64,
+    c: f64,
+}
+
+impl TimeAxis {
+    fn new(now: i64, wf: f32) -> TimeAxis {
+        let r2 = (EDGE_S / CENTRE_HALF_S).powi(2);
+        let c = (r2 - 1.0) / (r2 - 4.0);
+        TimeAxis { now, half_w: wf / 2.0, k: 2.0 * CENTRE_HALF_S * (c - 0.25).sqrt(), c }
+    }
+
+    /// The time at pixel x (0 at the left edge, the width at the right).
+    fn t(&self, x: f32) -> i64 {
+        let u = ((x - self.half_w) / self.half_w).clamp(-1.0, 1.0) as f64;
+        self.now + (self.k * u / (self.c - u * u).sqrt()) as i64
+    }
+
+    /// The pixel x of time t: the exact inverse, u = s·√(c / (1 + s²)) with s = (t − now) / k.
+    fn x(&self, t: i64) -> f32 {
+        let s = (t - self.now) as f64 / self.k;
+        self.half_w + (s * (self.c / (1.0 + s * s)).sqrt()) as f32 * self.half_w
+    }
+}
+
+/// One pixel column, per row as visible 0xRRGGBB: `fill` is its sky and water alone, `full` adds the waterline and the sun and moon curves (the centreline is XORed in afterwards, like the bars).
+struct Column {
+    fill: Vec<u32>,
+    full: Vec<u32>,
+}
+
+/// The column covering times [a, b) as the average of one-pixel-wide slices, one per sample instant, with no lines drawn as paths anywhere. Each slice, bottom to top: that instant's sky above its waterline (the sun lights red + green, the moon blue) and water below; a 1-row stroke on the waterline; and the moon's and then the sun's altitude as a mark of fixed height, 2 rows of colour with a black row above and below. Averaged in linear light and encoded to sRGB once. Near now the slices barely differ and this is the crisp chart; months out each pixel shows the share of time the water was above it, and the curves become glows across their range of altitudes. At least 9 samples, one per 10 minutes beyond that up to 256 (a wide column's picture converges statistically, so its span doesn't matter past that: 256 puts each sample at one 8-bit step's weight), at jittered times. Every overlay is a fixed number of rows in every slice, whatever the slope: the waterline 1, each curve 4 (2 of colour between 2 of black). `maxes`: the sun's and moon's highest altitudes over the year, at the top edge.
+fn column((a, b): (i64, i64), h: usize, seed: u64, maxes: (f64, f64)) -> Column {
+    let hf = h as f32;
+    let (water, stroke, sun_ink, moon_ink) = (linear(WATER), linear(STROKE), linear(SKY_SUN), linear(SKY_MOON));
+    let (sun_curve, moon_curve) = (linear(SUN), linear(MOON));
+    let n = ((b - a) / 600).clamp(9, 256);
+    let mid = hf / 2.0;
+    let altitude_y = |alt: f64, max: f64| mid - (alt / max) as f32 * (mid - 1.0);
+    // Each instant: waterline y, sky colour (linear), sun and moon curve y.
+    let slices: Vec<(f32, [f32; 3], f32, f32)> = jittered(a, b, n, seed)
+        .map(|t| {
+            let ft = tide_core::predict(tide_core::BREMERTON, t as f64) as f32 + MSL_TO_MLLW;
+            let y = hf * (1.0 - ((ft - TIDE_MIN_FT) / (TIDE_MAX_FT - TIDE_MIN_FT)).clamp(0.0, 1.0));
+            let (sun_alt, moon_alt) = (sun_altitude_deg(t), moon_altitude_deg(t));
+            let (sun, moon) = (sun_alt > 0.0, moon_alt > 0.0);
+            let sky: [f32; 3] = core::array::from_fn(|c| if sun { sun_ink[c] } else { 0.0 } + if moon { moon_ink[c] } else { 0.0 });
+            (y, sky, altitude_y(sun_alt, maxes.0), altitude_y(moon_alt, maxes.1))
+        })
+        .collect();
+    // Sums over the slices per row: sky above each waterline and water below it go in as difference arrays (prefix-summed at the end), the waterline's own row directly; `delta` is what the overlays (strokes, centreline, curves) change on the rows they touch.
+    let mut sum = vec![[0f32; 3]; h];
+    let mut sky_d = vec![[0f32; 3]; h + 1];
+    let mut water_d = vec![0f32; h + 1];
+    let mut delta = vec![[0f32; 3]; h];
+    let beneath = |y: usize, line: f32, sky: &[f32; 3]| -> [f32; 3] {
+        let wv = ((y as f32 + 1.0) - line).clamp(0.0, 1.0);
+        core::array::from_fn(|c| wv * water[c] + (1.0 - wv) * sky[c])
+    };
+    for &(y, sky, sun_y, moon_y) in &slices {
+        let fy = (y as usize).min(h);
+        for c in 0..3 {
+            sky_d[0][c] += sky[c];
+            sky_d[fy][c] -= sky[c];
+        }
+        if fy < h {
+            let u = beneath(fy, y, &sky);
+            for c in 0..3 {
+                sum[fy][c] += u[c];
+            }
+            water_d[fy + 1] += 1.0;
+        }
+        // The overlays, bottom to top: (top, bottom, ink).
+        let overlays: [(f32, f32, [f32; 3]); 5] = [
+            (y - 0.5, y + 0.5, stroke),
+            (moon_y - 2.0, moon_y + 2.0, stroke),
+            (moon_y - 1.0, moon_y + 1.0, moon_curve),
+            (sun_y - 2.0, sun_y + 2.0, stroke),
+            (sun_y - 1.0, sun_y + 1.0, sun_curve),
+        ];
+        let mut rows: Vec<usize> = overlays.iter().flat_map(|&(top, bottom, _)| (top.max(0.0) as usize)..(bottom.ceil().min(hf) as usize)).collect();
+        rows.sort_unstable();
+        rows.dedup();
+        for r in rows {
+            let base = beneath(r, y, &sky);
+            let mut px = base;
+            for &(top, bottom, ink) in &overlays {
+                let cover = (bottom.min(r as f32 + 1.0) - top.max(r as f32)).clamp(0.0, 1.0);
+                if cover > 0.0 {
+                    for c in 0..3 {
+                        px[c] = cover * ink[c] + (1.0 - cover) * px[c];
+                    }
+                }
+            }
+            for c in 0..3 {
+                delta[r][c] += px[c] - base[c];
+            }
+        }
+    }
+    let (mut sky_run, mut water_run) = ([0f32; 3], 0f32);
+    let mut out = Column { fill: vec![0; h], full: vec![0; h] };
+    for y in 0..h {
+        water_run += water_d[y];
+        for c in 0..3 {
+            sky_run[c] += sky_d[y][c];
+            sum[y][c] += sky_run[c] + water_run * water[c];
+        }
+        let k = 1.0 / n as f32;
+        out.fill[y] = encode(core::array::from_fn(|c| sum[y][c] * k));
+        out.full[y] = encode(core::array::from_fn(|c| (sum[y][c] + delta[y][c]) * k));
+    }
+    out
+}
+
+/// Visible 0xRRGGBB → linear light per channel (the sRGB curve).
+fn linear(hex: u32) -> [f32; 3] {
+    core::array::from_fn(|c| {
+        let v = ((hex >> (16 - 8 * c)) & 0xFF) as f32 / 255.0;
+        if v <= 0.04045 { v / 12.92 } else { ((v + 0.055) / 1.055).powf(2.4) }
+    })
+}
+
+/// Linear light per channel → visible 0xRRGGBB through the sRGB curve, floored onto the 256 codes (each code an equal share of the encoded range).
+fn encode(l: [f32; 3]) -> u32 {
+    l.iter().enumerate().fold(0, |acc, (c, &v)| {
+        let v = v.clamp(0.0, 1.0);
+        let e = if v <= 0.003_130_8 { 12.92 * v } else { 1.055 * v.powf(1.0 / 2.4) - 0.055 };
+        acc | ((e * 256.0).min(255.0) as u32) << (16 - 8 * c)
+    })
+}
+
+/// `n` times across [a, b), one at a random point in each of n equal strata (stratified jitter: never clumped, never on a fixed grid that could beat against the tides). `seed` fixes the draw, so a frame is reproducible.
+fn jittered(a: i64, b: i64, n: i64, seed: u64) -> impl Iterator<Item = i64> {
+    (0..n).map(move |i| a + ((b - a) as f64 * (i as f64 + unit_random(seed ^ (i as u64).wrapping_mul(0xD1B5_4A32_D192_ED03))) / n as f64) as i64)
+}
+
+/// A uniform number in [0, 1) from `x`: splitmix64's finaliser, top 53 bits.
+fn unit_random(x: u64) -> f64 {
+    let mut z = x.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    ((z ^ (z >> 31)) >> 11) as f64 / (1u64 << 53) as f64
 }
 
 // ── Fluor-style frame ───────────────────────────────────────────────────────
@@ -231,18 +364,17 @@ fn under(top: Argb8, bottom: Argb8) -> Argb8 {
     (((top >> 24) + consumed) << 24) | ch(16) | ch(8) | ch(0)
 }
 
-/// The running composite in fluor's α + darkness format, built topmost-first with `under`. Carries a reusable coverage mask for path rasterization and the per-column day/night flags for side-coloured layers.
+/// The running composite in fluor's α + darkness format, built topmost-first with `under`. Carries a reusable coverage mask for path rasterization (the glyphs).
 struct Frame {
     w: usize,
     h: usize,
     px: Vec<Argb8>,
     mask: Mask,
-    night: Vec<bool>,
 }
 
 impl Frame {
-    fn new(w: usize, h: usize, night: Vec<bool>) -> Self {
-        Self { w, h, px: vec![0; w * h], mask: Mask::new(w as u32, h as u32).expect("mask size"), night }
+    fn new(w: usize, h: usize) -> Self {
+        Self { w, h, px: vec![0; w * h], mask: Mask::new(w as u32, h as u32).expect("mask size") }
     }
 
     /// Compose visible colour `hex` at opacity `a` (0..=255) under pixel `i`.
@@ -257,27 +389,6 @@ impl Frame {
         for y in y0.max(0)..y1.min(self.h as i32) {
             for x in x0.max(0)..x1.min(self.w as i32) {
                 self.under(y as usize * self.w + x as usize, hex, 255);
-            }
-        }
-    }
-
-    /// Rasterize `path` (pixel space) to anti-aliased coverage and compose it under the frame: `day` on day columns, `night` on night columns. Only the path's bounding box is visited, and the mask is cleared behind itself for reuse.
-    fn under_path(&mut self, path: &Path, day: u32, night: u32) {
-        let b = path.bounds();
-        let (x0, x1) = ((b.left().floor() as i32).max(0) as usize, (b.right().ceil() as i32 + 1).clamp(0, self.w as i32) as usize);
-        let (y0, y1) = ((b.top().floor() as i32).max(0) as usize, (b.bottom().ceil() as i32 + 1).clamp(0, self.h as i32) as usize);
-        if x0 >= x1 || y0 >= y1 {
-            return;
-        }
-        self.mask.fill_path(path, FillRule::Winding, true, Transform::identity());
-        for y in y0..y1 {
-            for x in x0..x1 {
-                let i = y * self.w + x;
-                let cov = std::mem::take(&mut self.mask.data_mut()[i]) as u32;
-                if cov != 0 {
-                    let hex = if self.night[x] { night } else { day };
-                    self.under(i, hex, cov);
-                }
             }
         }
     }
@@ -302,44 +413,25 @@ impl Frame {
         }
     }
 
-    /// 2px curve, then its 1px stroke each side (a 4px stroke centred on it) under it.
-    fn curve_then_stroke(&mut self, curve: &Path, hex: u32) {
-        if let Some(c) = stroked(curve, 2.0) {
-            self.under_path(&c, hex, hex);
-        }
-        if let Some(s) = stroked(curve, 4.0) {
-            self.under_path(&s, STROKE, STROKE);
-        }
-    }
-
-    /// Opaque fill under everything, one colour per column. Already-opaque pixels early-out.
-    fn under_fill(&mut self, columns: &[u32]) {
-        for y in 0..self.h {
-            for (x, &hex) in columns.iter().enumerate() {
-                self.under(y * self.w + x, hex, 255);
-            }
-        }
-    }
-
     /// Flip darkness back to visible RGB (fluor's present-boundary XOR). The sky saturated α, so every pixel is opaque.
     fn finish(self) -> Vec<u32> {
         self.px.into_iter().map(|p| p ^ 0x00FF_FFFF).collect()
     }
 }
 
-/// Per-channel blend of visible colours `a` → `b` by `t` (0..=255).
-fn mix(a: u32, b: u32, t: u32) -> u32 {
-    let ch = |s: u32| ((((a >> s) & 0xFF) * (255 - t) + ((b >> s) & 0xFF) * t + 127) / 255) << s;
-    ch(16) | ch(8) | ch(0)
-}
-
-/// Bare 1px vertical bar in the pixel column containing `x`, rows y0..y1 — no edges (the hi/lo bars).
-fn vline(f: &mut Frame, x: f32, y0: i32, y1: i32, hex: u32) {
+/// Bare 1px vertical bar in the pixel column containing `x`, rows y0..y1, no edges (the hi/lo bars): each pixel is what's beneath it (`under`, the frame's background) with the channels `ink` carries flipped, so the bar shows on any fill.
+fn vline(f: &mut Frame, x: f32, y0: i32, y1: i32, ink: u32, under: &[u32]) {
     let col = x.floor() as i32;
-    f.under_rect(col, y0, col + 1, y1, hex);
+    if !(0..f.w as i32).contains(&col) {
+        return;
+    }
+    for y in y0.max(0)..y1.min(f.h as i32) {
+        let i = y as usize * f.w + col as usize;
+        f.under(i, under[i] ^ ink, 255);
+    }
 }
 
-/// 1px vertical bar in the pixel column containing `x`, rows y0..y1, then its 1px black edge on each side (the now bar and the ticks).
+/// Solid 1px vertical bar in the pixel column containing `x`, rows y0..y1, then its 1px black edge on each side (the now bar).
 fn edged_vline(f: &mut Frame, x: f32, y0: i32, y1: i32, hex: u32) {
     if y1 <= y0 {
         return;
@@ -348,25 +440,6 @@ fn edged_vline(f: &mut Frame, x: f32, y0: i32, y1: i32, hex: u32) {
     f.under_rect(col, y0, col + 1, y1, hex);
     f.under_rect(col - 1, y0, col, y1, STROKE);
     f.under_rect(col + 1, y0, col + 2, y1, STROKE);
-}
-
-fn stroked(path: &Path, width: f32) -> Option<Path> {
-    path.stroke(&Stroke { width, line_cap: LineCap::Round, line_join: LineJoin::Round, ..Default::default() }, 1.0)
-}
-
-/// A body's altitude across the window as a polyline, sampled every 2px.
-fn altitude_path(wf: f32, t_at: &dyn Fn(f32) -> i64, alt_y: &dyn Fn(f64) -> f32, alt: fn(i64) -> f64) -> Path {
-    let mut pb = PathBuilder::new();
-    let mut x = 0.0f32;
-    loop {
-        let y = alt_y(alt(t_at(x)));
-        if x == 0.0 { pb.move_to(x, y) } else { pb.line_to(x, y) }
-        if x >= wf {
-            break;
-        }
-        x = (x + 2.0).min(wf);
-    }
-    pb.finish().unwrap()
 }
 
 /// Sharpen a high/low found on the 6-minute sample grid (good to ±3 min, and the grid moves with now, so the time would jitter between redraws) to the instant the tide's slope crosses zero: bisect a central-difference derivative of tide-core's prediction across ±12 min, to the second.
@@ -384,8 +457,9 @@ fn refine_extremum(t0: i64) -> i64 {
     (a + b) / 2
 }
 
-/// Sunrise/sunset in the ±12h window: (x, crossing time, is sunrise), where the sun's altitude crosses 0° (the seam), bisected to the second.
-fn sun_crossings(unix: i64, wf: f32) -> Vec<(f32, i64, bool)> {
+/// Sunrise/sunset in the ±12h around now: (x, crossing time, is sunrise), where the sun's altitude crosses 0° (the seam), bisected to the second.
+fn sun_crossings(axis: &TimeAxis) -> Vec<(f32, i64, bool)> {
+    let (unix, wf) = (axis.now, 2.0 * axis.half_w);
     let mut out = Vec::new();
     let mut prev_t = unix - 12 * 3600;
     let mut prev_a = sun_altitude_deg(prev_t);
@@ -398,7 +472,7 @@ fn sun_crossings(unix: i64, wf: f32) -> Vec<(f32, i64, bool)> {
                 let m = (lo_t + hi_t) / 2;
                 if (sun_altitude_deg(m) < 0.0) == (prev_a < 0.0) { lo_t = m } else { hi_t = m }
             }
-            let xf = wf / 2.0 + (hi_t - unix) as f32 / 86400.0 * wf;
+            let xf = axis.x(hi_t);
             if (0.0..wf).contains(&xf) {
                 out.push((xf, hi_t, a > prev_a));
             }
@@ -550,18 +624,6 @@ fn rotated_text_paths(font: &Face, text: &[char], cx: f32, top: f32, sunrise: bo
 
 // ── Time, tide and sky math (shared with the panel firmware) ───────────────
 
-fn interp(s: &[f32; N_SAMPLES], si: f32) -> f32 {
-    if si <= 0.0 {
-        return s[0];
-    }
-    if si >= (N_SAMPLES - 1) as f32 {
-        return s[N_SAMPLES - 1];
-    }
-    let i = si as usize;
-    let frac = si - i as f32;
-    s[i] + frac * (s[i + 1] - s[i])
-}
-
 /// Wall-clock rounded to the nearest 10-minute mark (the same rounding the dozenal odometer uses), wrapping at midnight.
 fn round_to_10((hh, mm): (u32, u32)) -> (u32, u32) {
     let counter = ((hh * 60 + mm + 5) / 10) % 144;
@@ -621,6 +683,15 @@ fn tz_offset_secs(unix: i64) -> i64 {
     } else {
         -8 * 3600
     }
+}
+
+/// The first local hour mark at or after `t` whose local hour is a multiple of `step` (1: every hour, 2: every dozenal hour, 24: midnight). Pacific offsets are whole hours, so local hour marks are UTC hour marks; across a daylight-saving change the local hours skip or repeat and this just takes the next one that fits.
+fn next_mark(t: i64, step: i64) -> i64 {
+    let mut m = t + (-(t + tz_offset_secs(t))).rem_euclid(3600);
+    while (m + tz_offset_secs(m)).rem_euclid(86400) / 3600 % step != 0 {
+        m += 3600;
+    }
+    m
 }
 
 fn local_hh_mm(unix: i64) -> (u32, u32) {
