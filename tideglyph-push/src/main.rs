@@ -107,6 +107,12 @@ async fn cmd_battery() -> Result<()> {
         let raw = u16::from_le_bytes([v[2], v[3]]);
         let count = u16::from_le_bytes([v[4], v[5]]);
         println!("battery: {mv} mV  (raw {raw})  refresh_count {count}");
+        if v.len() >= 10 {
+            // POWER.RESETREAS as the device read it at boot: none set means power-on or brownout.
+            let reasons = u32::from_le_bytes([v[6], v[7], v[8], v[9]]);
+            let names: Vec<&str> = [(0, "reset pin"), (1, "watchdog"), (2, "software reset"), (3, "lockup"), (16, "wake from System OFF (GPIO)"), (17, "wake from System OFF (LPCOMP)"), (18, "debug interface"), (19, "wake from System OFF (NFC)"), (20, "wake from System OFF (VBUS)")].iter().filter(|&&(bit, _)| reasons >> bit & 1 == 1).map(|&(_, name)| name).collect();
+            println!("last start: {} ({reasons:#x})", if names.is_empty() { "power-on or brownout".to_string() } else { names.join(", ") });
+        }
     } else if v.len() >= 4 {
         let mv = u16::from_le_bytes([v[0], v[1]]);
         let raw = u16::from_le_bytes([v[2], v[3]]);

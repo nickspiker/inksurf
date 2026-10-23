@@ -10,8 +10,7 @@ fn main() {
     println!("cargo::rustc-link-search={}", out.display());
     // NOTE: deliberately emit NO `rerun-if-changed`. With any such directive, cargo
     // re-runs build.rs only when those files change — so a main.rs-only edit left
-    // BUILD_UNIX_SECS/FIRMWARE_BUILD_STAMP frozen at the last build.rs run (it went
-    // ~14h stale, booting the clock into "yesterday"). With none, cargo re-runs
+    // FIRMWARE_BUILD_STAMP frozen at the last build.rs run. With none, cargo re-runs
     // build.rs whenever ANY package file changes, so every real build re-stamps.
     println!("cargo::rustc-link-arg-bins=--nmagic");
     println!("cargo::rustc-link-arg-bins=-Tlink.x");
@@ -22,16 +21,8 @@ fn main() {
     // be pushed an image older than the one it's running. Recomputed every build
     // (never cached) so the floor always advances.
     let stamp = vsf::eagle_time_oscillations();
-    // Build-time Unix seconds — used as an approximate "now" for the first tide
-    // render until the device gets a real time source (set over BLE).
-    let unix = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_secs() as i64;
-    fs::write(
-        out.join("build_stamp.rs"),
-        format!("pub const FIRMWARE_BUILD_STAMP: i64 = {stamp};\npub const BUILD_UNIX_SECS: i64 = {unix};\n"),
-    )
+    // No build time any more: a clock that has never been set shows solid red rather than guessing from it (see EPOCH_BASE in main.rs).
+    fs::write(out.join("build_stamp.rs"), format!("pub const FIRMWARE_BUILD_STAMP: i64 = {stamp};\n"))
     .expect("write build_stamp.rs");
 
     // Decode the font PNGs into const bitmaps for the on-device labels. Each glyph

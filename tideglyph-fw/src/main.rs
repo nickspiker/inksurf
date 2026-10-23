@@ -277,10 +277,9 @@ struct OtaService {
     data: [u8; 244],
     #[characteristic(uuid = "b5f90004-2d5a-4f3c-9b1a-1d2e3f405060", read, value = [0u8; 6])]
     status: [u8; 6],
-    /// Battery + liveness: [mV u16 LE, raw u16 LE, refresh_count u16 LE]. The
-    /// count increments every refresh, so a reader can confirm the clock is ticking.
-    #[characteristic(uuid = "b5f90005-2d5a-4f3c-9b1a-1d2e3f405060", read, value = [0u8; 6])]
-    battery: [u8; 6],
+    /// Battery + liveness: [mV u16 LE, raw u16 LE, refresh_count u16 LE, reset reason u32 LE (POWER.RESETREAS at boot)]. The count increments every refresh, so a reader can confirm the clock is ticking.
+    #[characteristic(uuid = "b5f90005-2d5a-4f3c-9b1a-1d2e3f405060", read, value = [0u8; 10])]
+    battery: [u8; 10],
     #[characteristic(uuid = "b5f90006-2d5a-4f3c-9b1a-1d2e3f405060", write, value = [0u8; 8])]
     time: [u8; 8],
 }
@@ -785,6 +784,12 @@ fn batt_soc_permille(mv: u16) -> u32 {
 
 async fn render_tide(unix: i64, batt_mv: u16) {
     let canvas = unsafe { &mut *core::ptr::addr_of_mut!(CANVAS) };
+    // Unknown time (a cold start with no time set): solid red, unmistakably not a tide chart, until the clock is set over BLE.
+    if unix < Y2K {
+        canvas.fill(C_RED);
+        pack(canvas);
+        return;
+    }
     for p in canvas.iter_mut() {
         *p = C_WHITE;
     }
@@ -1005,9 +1010,7 @@ fn pack(canvas: &[u8; CW * CH]) {
 /// Refresh cadence. 10 min = the design point for battery life.
 const REFRESH_SECS: u64 = 600;
 
-// Wall-clock epoch: unix seconds at uptime 0. 0 = fall back to the compile-time
-// build stamp (roughly right since build ≈ flash). Set precisely over BLE via the
-// time characteristic. u32 seconds is good through year 2106.
+// Wall-clock epoch: unix seconds at uptime 0, set over BLE via the time characteristic or restored from Retained after a warm reset. 0 = unknown: the time then reads as early 1970, and the panel shows solid red instead of plausible but wrong tides. u32 seconds is good through year 2106.
 static EPOCH_BASE: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 
 // Signalled when the clock is set, so the refresh loop abandons its stale sleep
@@ -1024,16 +1027,57 @@ static CLOCK_SET: embassy_sync::signal::Signal<
 static OTA_ACTIVE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
 fn now_unix() -> i64 {
-    let base = EPOCH_BASE.load(core::sync::atomic::Ordering::Relaxed);
-    let base = if base == 0 { BUILD_UNIX_SECS } else { base as i64 };
-    base + embassy_time::Instant::now().as_secs() as i64
+    EPOCH_BASE.load(core::sync::atomic::Ordering::Relaxed) as i64 + embassy_time::Instant::now().as_secs() as i64
+}
+
+/// Set the wall clock without waking the refresh loop (at boot, before it runs).
+fn set_epoch(unix: i64) {
+    let uptime = embassy_time::Instant::now().as_secs() as i64;
+    // .max(1): never store 0, the "unknown" sentinel.
+    EPOCH_BASE.store((unix - uptime).max(1) as u32, core::sync::atomic::Ordering::Relaxed);
 }
 
 fn set_now(unix: i64) {
-    let uptime = embassy_time::Instant::now().as_secs() as i64;
-    // .max(1): never store 0, which is the "unset, use build stamp" sentinel.
-    EPOCH_BASE.store((unix - uptime).max(1) as u32, core::sync::atomic::Ordering::Relaxed);
+    set_epoch(unix);
     CLOCK_SET.signal(()); // wake the refresh loop to re-align to the new mark
+}
+
+/// Times before 2000 mean the clock is unknown (see EPOCH_BASE).
+const Y2K: i64 = 946_684_800;
+
+/// The wall clock kept across warm resets (watchdog, software reset including the OTA swap, lockup), which leave RAM as it was: in the RETAINED region (memory.x), never initialised. A cold start (power-on, brownout) leaves garbage, which `check` (the complement of `unix`, XORed with the magic) rejects.
+#[repr(C)]
+struct Retained {
+    magic: u32,
+    unix: i64,
+    check: i64,
+}
+const RETAINED_MAGIC: u32 = 0x7469_6465;
+#[link_section = ".retained"]
+static mut RETAINED: core::mem::MaybeUninit<Retained> = core::mem::MaybeUninit::uninit();
+
+fn retain_clock(unix: i64) {
+    let r = Retained { magic: RETAINED_MAGIC, unix, check: !unix ^ RETAINED_MAGIC as i64 };
+    unsafe { core::ptr::write_volatile(core::ptr::addr_of_mut!(RETAINED) as *mut Retained, r) }
+}
+
+fn retained_clock() -> Option<i64> {
+    let r = unsafe { core::ptr::read_volatile(core::ptr::addr_of!(RETAINED) as *const Retained) };
+    (r.magic == RETAINED_MAGIC && r.check == !r.unix ^ RETAINED_MAGIC as i64 && r.unix > Y2K).then_some(r.unix)
+}
+
+/// Why the chip last started: POWER.RESETREAS as read at boot (0 = power-on or brownout), reported in the battery characteristic.
+static RESET_REASON: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+/// Save the wall clock to Retained every 2 s while it's known, so a warm reset resumes within a few seconds of where it was.
+#[embassy_executor::task]
+async fn keep_clock() -> ! {
+    loop {
+        if EPOCH_BASE.load(core::sync::atomic::Ordering::Relaxed) != 0 {
+            retain_clock(now_unix());
+        }
+        Timer::after(Duration::from_secs(2)).await;
+    }
 }
 
 /// The peripherals a refresh cycle needs. Held as masters; each cycle clones them
@@ -1106,6 +1150,15 @@ async fn main(spawner: Spawner) {
             spawner.spawn(unwrap!(wdt_pet(h)));
         }
     }
+
+    // Why we started (cleared once read, so the next reset reports its own), and the wall clock back from Retained if this was a warm reset: resumed a couple of seconds on from its last save, for the reset and boot. An OTA swap takes the bootloader ~40 s, which the clock loses.
+    let reasons = embassy_nrf::pac::POWER.resetreas().read();
+    embassy_nrf::pac::POWER.resetreas().write_value(reasons);
+    RESET_REASON.store(reasons.0, core::sync::atomic::Ordering::Relaxed);
+    if let Some(unix) = retained_clock() {
+        set_epoch(unix + 2);
+    }
+    spawner.spawn(unwrap!(keep_clock()));
 
     stage(1).await; // embassy init OK
 
@@ -1223,10 +1276,11 @@ where
     })));
 
     let set_batt = |b: (u16, u16), count: u16| {
-        let mut bch = [0u8; 6];
+        let mut bch = [0u8; 10];
         bch[0..2].copy_from_slice(&b.0.to_le_bytes());
         bch[2..4].copy_from_slice(&b.1.to_le_bytes());
         bch[4..6].copy_from_slice(&count.to_le_bytes());
+        bch[6..10].copy_from_slice(&RESET_REASON.load(core::sync::atomic::Ordering::Relaxed).to_le_bytes());
         let _ = server.set(&server.ota.battery, &bch);
     };
     set_batt(batt, 0);
